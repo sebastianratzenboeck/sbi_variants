@@ -7,13 +7,14 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, Sampler
 
 # Support both:
 #   python -m sbi_variants.train_sbi_posterior
@@ -44,6 +45,107 @@ from train_mock_galaxy import (
     load_data as load_raw_data,
     save_arrays as save_cache_arrays,
 )
+
+_BIN_SAMPLER_CHUNK_SIZE = 1_000_000
+
+
+class _JointBinFirstSampler(Sampler[int]):
+    """Sample bins from q_bin, then sample rows uniformly within each chosen bin."""
+
+    def __init__(
+        self,
+        *,
+        active_bins: np.ndarray,
+        q_bin: np.ndarray,
+        sorted_indices_by_bin: np.ndarray,
+        bin_offsets: np.ndarray,
+        num_samples: int,
+        seed: int,
+        chunk_size: int = _BIN_SAMPLER_CHUNK_SIZE,
+    ):
+        active_bins = np.asarray(active_bins, dtype=np.int64)
+        bin_offsets = np.asarray(bin_offsets, dtype=np.int64)
+        sorted_indices_by_bin = np.asarray(sorted_indices_by_bin, dtype=np.int64)
+        q_bin = np.asarray(q_bin, dtype=np.float64)
+
+        if active_bins.ndim != 1 or active_bins.size == 0:
+            raise ValueError("active_bins must be a non-empty 1-D array.")
+        if q_bin.ndim != 1:
+            raise ValueError(f"q_bin must be 1-D, got shape={q_bin.shape}")
+        if bin_offsets.ndim != 1 or bin_offsets.size != (q_bin.size + 1):
+            raise ValueError(
+                "bin_offsets must be 1-D with length n_bins+1. "
+                f"Got len={bin_offsets.size}, n_bins={q_bin.size}."
+            )
+        if int(bin_offsets[-1]) != int(sorted_indices_by_bin.size):
+            raise ValueError(
+                "sorted_indices_by_bin length must match bin_offsets[-1]. "
+                f"Got {sorted_indices_by_bin.size} vs {int(bin_offsets[-1])}."
+            )
+        if int(num_samples) <= 0:
+            raise ValueError(f"num_samples must be > 0, got {num_samples}")
+        if int(chunk_size) <= 0:
+            raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+
+        q_active = q_bin[active_bins].astype(np.float64, copy=True)
+        q_active_sum = float(q_active.sum())
+        if q_active_sum <= 0.0:
+            raise ValueError("q_bin has no positive mass on active bins.")
+        q_active /= q_active_sum
+
+        self.active_bins = active_bins
+        self.q_active = q_active
+        self.sorted_indices_by_bin = sorted_indices_by_bin
+        self.bin_offsets = bin_offsets
+        self.num_samples = int(num_samples)
+        self.seed = int(seed)
+        self.chunk_size = int(chunk_size)
+
+    def __iter__(self) -> Iterator[int]:
+        rng = np.random.default_rng(self.seed)
+        remaining = self.num_samples
+        while remaining > 0:
+            m = min(self.chunk_size, remaining)
+            remaining -= m
+
+            sampled_bins = rng.choice(
+                self.active_bins,
+                size=m,
+                replace=True,
+                p=self.q_active,
+            )
+            sampled_rows = np.empty(m, dtype=np.int64)
+            unique_bins, inverse = np.unique(sampled_bins, return_inverse=True)
+            for j, b in enumerate(unique_bins):
+                mask = inverse == j
+                n_b = int(mask.sum())
+                lo = int(self.bin_offsets[int(b)])
+                hi = int(self.bin_offsets[int(b) + 1])
+                draw_pos = rng.integers(lo, hi, size=n_b)
+                sampled_rows[mask] = self.sorted_indices_by_bin[draw_pos]
+
+            for idx in sampled_rows:
+                yield int(idx)
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+
+def _build_epoch_sampler(
+    *,
+    state: dict[str, np.ndarray | float | int],
+    q_bin: np.ndarray,
+    num_samples: int,
+    seed: int,
+) -> Sampler[int]:
+    return _JointBinFirstSampler(
+        active_bins=state["active_bins"],
+        q_bin=q_bin,
+        sorted_indices_by_bin=state["sorted_indices_by_bin"],
+        bin_offsets=state["bin_offsets"],
+        num_samples=num_samples,
+        seed=seed,
+    )
 
 try:
     from torch.amp import GradScaler, autocast
@@ -361,20 +463,30 @@ def _prepare_joint_curriculum_state(
     age_bin = np.clip(age_bin, 0, n_age_bins - 1)
     mass_bin = np.clip(mass_bin, 0, n_mass_bins - 1)
 
-    joint = age_bin * n_mass_bins + mass_bin
+    joint = (age_bin * n_mass_bins + mass_bin).astype(np.int32, copy=False)
     n_joint_bins = int(n_age_bins * n_mass_bins)
-    counts = np.bincount(joint, minlength=n_joint_bins).astype(np.float64)
+    counts = np.bincount(joint, minlength=n_joint_bins).astype(np.int64)
     active = counts > 0
     if active.sum() == 0:
         raise ValueError("Joint curriculum found no active bins.")
 
-    p_bin = np.zeros_like(counts, dtype=np.float64)
-    p_bin[active] = counts[active] / counts[active].sum()
+    p_bin = np.zeros(n_joint_bins, dtype=np.float64)
+    counts_f = counts.astype(np.float64)
+    p_bin[active] = counts_f[active] / counts_f[active].sum()
+
+    active_bins = np.flatnonzero(active).astype(np.int64)
+    sorted_pos = np.argsort(joint, kind="stable").astype(np.int64, copy=False)
+    bin_offsets = np.zeros(n_joint_bins + 1, dtype=np.int64)
+    bin_offsets[1:] = np.cumsum(counts, dtype=np.int64)
+
     return {
-        "joint": joint.astype(np.int64),
+        "joint": joint,
         "counts": counts,
         "p_bin": p_bin,
         "active": active,
+        "active_bins": active_bins,
+        "sorted_indices_by_bin": sorted_pos,
+        "bin_offsets": bin_offsets,
         "n_active": int(active.sum()),
     }
 
@@ -466,7 +578,6 @@ def _joint_curriculum_distributions(
     importance_weight_max: float,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     joint = state["joint"]
-    counts = state["counts"]
     p_bin = state["p_bin"]
     active = state["active"]
     n_active = int(state["n_active"])
@@ -475,18 +586,15 @@ def _joint_curriculum_distributions(
     q_bin = np.zeros_like(p_bin, dtype=np.float64)
     q_bin[active] = (1.0 - lam) * p_bin[active] + lam * (1.0 / float(n_active))
 
-    q_i = q_bin[joint] / counts[joint]
-    q_i = q_i / q_i.sum()
-
     if importance_weighting:
         w_i = (p_bin[joint] / q_bin[joint]).astype(np.float32)
         w_i /= max(float(w_i.mean()), 1e-8)
         w_i = np.clip(w_i, float(importance_weight_min), float(importance_weight_max)).astype(np.float32)
         w_i /= max(float(w_i.mean()), 1e-8)
     else:
-        w_i = np.ones_like(q_i, dtype=np.float32)
+        w_i = np.ones_like(joint, dtype=np.float32)
 
-    return q_i.astype(np.float64), w_i, lam
+    return q_bin.astype(np.float64), w_i, lam
 
 
 def _build_model(args: argparse.Namespace, input_columns: list[str], theta_dim: int) -> torch.nn.Module:
@@ -752,11 +860,13 @@ def main() -> None:
     hist = []
 
     t0 = time.time()
+    if args.joint_curriculum:
+        print("Using joint bin-first sampler (sample bin -> sample row uniformly within bin).")
     for epoch in range(args.epochs):
         curriculum_log = {}
         if args.joint_curriculum:
             tau = _compute_tau(epoch, args.epochs, args.tau_max, args.tau_warmup)
-            q_i, w_i, lam = _joint_curriculum_distributions(
+            q_bin, w_i, lam = _joint_curriculum_distributions(
                 curriculum_state,
                 tau=tau,
                 importance_weighting=args.importance_weighting,
@@ -764,13 +874,11 @@ def main() -> None:
                 importance_weight_max=args.importance_weight_max,
             )
             train_ds.sample_weight = torch.from_numpy(w_i.astype(np.float32))
-            sampler_gen = torch.Generator()
-            sampler_gen.manual_seed(int(args.seed + epoch))
-            sampler = WeightedRandomSampler(
-                weights=torch.from_numpy(q_i),
+            sampler = _build_epoch_sampler(
+                state=curriculum_state,
+                q_bin=q_bin,
                 num_samples=n_train_samples_per_epoch,
-                replacement=True,
-                generator=sampler_gen,
+                seed=int(args.seed + epoch),
             )
             epoch_train_loader = DataLoader(
                 train_ds,

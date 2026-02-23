@@ -173,8 +173,9 @@ class FlowMatchingTrainer:
 
         Args:
             indices: 1-D numpy array of global star indices (shuffled),
-                     produced by build_epoch_indices().  Each star appears
-                     at most once.  Epoch length = len(indices) // batch_size.
+                     produced by build_epoch_indices().  Indices may repeat
+                     when curriculum sampling uses replacement.
+                     Epoch length = len(indices) // batch_size.
             sample_weights: Optional 1-D numpy array aligned with ``indices``.
         """
         self._train_epoch_indices = torch.from_numpy(indices).long()

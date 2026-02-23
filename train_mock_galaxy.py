@@ -389,6 +389,32 @@ def compute_joint_age_mass_bin_indices(log_age, m_init, n_age_bins, n_mass_bins)
     return joint_idx, joint_counts
 
 
+def prepare_joint_bin_sampling_state(bin_idx, n_joint_bins):
+    """Precompute per-bin lookup state for efficient hierarchical sampling."""
+    bin_idx = np.asarray(bin_idx, dtype=np.int32)
+    bin_counts = np.bincount(bin_idx, minlength=int(n_joint_bins)).astype(np.int64)
+    active_bins = np.flatnonzero(bin_counts > 0).astype(np.int64)
+    if active_bins.size == 0:
+        raise ValueError("No active bins found for curriculum sampling.")
+
+    p = np.zeros(int(n_joint_bins), dtype=np.float64)
+    counts_f = bin_counts.astype(np.float64)
+    p[active_bins] = counts_f[active_bins] / counts_f[active_bins].sum()
+
+    sorted_indices_by_bin = np.argsort(bin_idx, kind="stable").astype(np.int64, copy=False)
+    bin_offsets = np.zeros(int(n_joint_bins) + 1, dtype=np.int64)
+    bin_offsets[1:] = np.cumsum(bin_counts, dtype=np.int64)
+    return {
+        "bin_idx": bin_idx,
+        "bin_counts": bin_counts,
+        "active_bins": active_bins,
+        "p_bin": p,
+        "sorted_indices_by_bin": sorted_indices_by_bin,
+        "bin_offsets": bin_offsets,
+        "n_active": int(active_bins.size),
+    }
+
+
 def compute_tau(epoch, total_epochs, tau_max, tau_warmup):
     """Compute temperature τ for the current epoch.
 
@@ -405,8 +431,7 @@ def compute_tau(epoch, total_epochs, tau_max, tau_warmup):
 
 
 def build_epoch_indices(
-    bin_idx,
-    bin_counts,
+    bin_state,
     tau,
     cap_per_bin,
     rng=None,
@@ -416,7 +441,7 @@ def build_epoch_indices(
     importance_weight_min=0.5,
     importance_weight_max=2.0,
 ):
-    """Select unique star indices for one epoch via joint-bin mixture sampling.
+    """Select star indices for one epoch via hierarchical joint-bin sampling.
 
     Let p(bin) be the natural split distribution over active bins (count > 0),
     and K be the number of active bins.  We define
@@ -424,36 +449,34 @@ def build_epoch_indices(
       q(bin) = (1 - λ) p(bin) + λ / K
 
     with λ = 1 - τ, so τ=0 is uniform-over-bins and τ=1 is natural.
-    Within each bin, stars are sampled uniformly without replacement.
+    For each sampled bin, stars are sampled uniformly with replacement.
 
     Args:
-        bin_idx:      1-D array, bin assignment for every star in this split.
-        bin_counts:   1-D array, number of stars per bin in this split.
+        bin_state:    Precomputed state from prepare_joint_bin_sampling_state().
         tau:          Curriculum temperature (0 = uniform q, 1 = natural q).
         cap_per_bin:  Per-reference-bin budget used to determine epoch size.
         rng:          numpy random Generator (for reproducibility).
         reference_bin_count: Number of reference bins that defines epoch budget.
             If None, uses number of active bins.
         importance_weighting: If True, compute per-sample weights p(bin)/q(bin),
-            where p is the natural bin fraction and q is the sampled epoch fraction.
+            where p is the natural bin fraction and q is the target bin mixture.
         importance_weight_min: Lower clip bound for normalized weights.
         importance_weight_max: Upper clip bound for normalized weights.
 
     Returns:
         (indices, sample_weights)
-        indices: 1-D numpy array of shuffled global indices.
+        indices: 1-D numpy array of shuffled split-local indices (duplicates allowed).
         sample_weights: Optional 1-D float32 numpy array aligned with ``indices``.
     """
     if rng is None:
         rng = np.random.default_rng()
 
-    pop_counts = np.asarray(bin_counts, dtype=np.float64)
-    active_bins = np.where(pop_counts > 0)[0]
+    pop_counts = np.asarray(bin_state["bin_counts"], dtype=np.float64)
+    active_bins = np.asarray(bin_state["active_bins"], dtype=np.int64)
     if active_bins.size == 0:
         return np.empty(0, dtype=np.int64), None
 
-    p = np.zeros_like(pop_counts, dtype=np.float64)
-    p[active_bins] = pop_counts[active_bins] / pop_counts[active_bins].sum()
+    p = np.asarray(bin_state["p_bin"], dtype=np.float64)
 
     lam = float(np.clip(1.0 - tau, 0.0, 1.0))
     q = np.zeros_like(pop_counts, dtype=np.float64)
@@ -466,42 +489,33 @@ def build_epoch_indices(
     else:
         ref_bins = int(max(1, min(int(reference_bin_count), int(active_bins.size))))
     epoch_size = int(np.rint(float(cap_per_bin) * float(ref_bins)))
-    epoch_size = int(max(int(active_bins.size), min(epoch_size, int(pop_counts.sum()))))
-    target_counts = np.maximum(
-        1,
-        np.rint(epoch_size * q[active_bins]).astype(np.int64),
-    )
-    max_counts = pop_counts[active_bins].astype(np.int64)
-    target_counts = np.minimum(target_counts, max_counts)
+    epoch_size = int(max(int(active_bins.size), epoch_size))
 
-    selected = []
-    selected_bins = []
-    selected_counts = np.zeros_like(bin_counts, dtype=np.int64)
-    for b, n_select in zip(active_bins.tolist(), target_counts.tolist()):
-        if n_select <= 0:
-            continue
-        members = np.where(bin_idx == b)[0]
-        chosen = rng.choice(members, size=n_select, replace=False)
-        selected.append(chosen)
-        selected_bins.append(np.full(n_select, b, dtype=np.int64))
-        selected_counts[b] = n_select
+    q_active = q[active_bins]
+    q_active = q_active / max(float(q_active.sum()), 1e-12)
+    chosen_bins = rng.choice(active_bins, size=epoch_size, replace=True, p=q_active).astype(np.int64)
 
-    if not selected:
-        return np.empty(0, dtype=np.int64), None
+    sorted_indices_by_bin = np.asarray(bin_state["sorted_indices_by_bin"], dtype=np.int64)
+    bin_offsets = np.asarray(bin_state["bin_offsets"], dtype=np.int64)
+    indices = np.empty(epoch_size, dtype=np.int64)
+    unique_bins, inverse = np.unique(chosen_bins, return_inverse=True)
+    for j, b in enumerate(unique_bins):
+        mask = (inverse == j)
+        n_select = int(mask.sum())
+        lo = int(bin_offsets[int(b)])
+        hi = int(bin_offsets[int(b) + 1])
+        draw_pos = rng.integers(lo, hi, size=n_select)
+        indices[mask] = sorted_indices_by_bin[draw_pos]
 
-    indices = np.concatenate(selected).astype(np.int64)
-    chosen_bins = np.concatenate(selected_bins).astype(np.int64)
-    perm = rng.permutation(len(indices))
+    perm = rng.permutation(epoch_size)
     indices = indices[perm]
     chosen_bins = chosen_bins[perm]
 
     sample_weights = None
     if importance_weighting:
-        q_emp = selected_counts.astype(np.float64)
-        q_emp = q_emp / max(q_emp.sum(), 1.0)
-        per_bin_w = np.zeros_like(p)
-        active = q_emp > 0
-        per_bin_w[active] = p[active] / q_emp[active]
+        per_bin_w = np.zeros_like(p, dtype=np.float64)
+        active = q > 0
+        per_bin_w[active] = p[active] / q[active]
         sample_weights = per_bin_w[chosen_bins].astype(np.float32)
 
         # Normalize to mean 1 and clip to control variance.
@@ -516,8 +530,8 @@ def build_epoch_indices(
     return indices, sample_weights
 
 
-def make_epoch_callback(bin_idx_train, bin_counts_train,
-                        bin_idx_val, bin_counts_val,
+def make_epoch_callback(bin_state_train,
+                        bin_state_val,
                         tau_max, tau_warmup,
                         cap_per_bin=1000,
                         reference_bin_count=None,
@@ -533,8 +547,7 @@ def make_epoch_callback(bin_idx_train, bin_counts_train,
         lam = float(np.clip(1.0 - tau, 0.0, 1.0))
 
         train_indices, train_weights = build_epoch_indices(
-            bin_idx_train,
-            bin_counts_train,
+            bin_state_train,
             tau,
             cap_per_bin,
             rng,
@@ -544,8 +557,7 @@ def make_epoch_callback(bin_idx_train, bin_counts_train,
             importance_weight_max=importance_weight_max,
         )
         val_indices, val_weights = build_epoch_indices(
-            bin_idx_val,
-            bin_counts_val,
+            bin_state_val,
             tau,
             cap_per_bin,
             rng,
@@ -561,8 +573,8 @@ def make_epoch_callback(bin_idx_train, bin_counts_train,
         n_train_steps = len(train_indices) // trainer.batch_size
         n_val_steps = len(val_indices) // trainer.batch_size
         current_lr = trainer.optimizer.param_groups[0]['lr']
-        active_train_bins = int((bin_counts_train > 0).sum())
-        active_val_bins = int((bin_counts_val > 0).sum())
+        active_train_bins = int(bin_state_train["n_active"])
+        active_val_bins = int(bin_state_val["n_active"])
         print(f'  [Curriculum] epoch={epoch+1}, τ={tau:.3f}, λ={lam:.3f}, '
               f'active_bins(train/val)={active_train_bins}/{active_val_bins}, '
               f'train_stars={len(train_indices):,} ({n_train_steps} steps), '
@@ -596,7 +608,7 @@ def make_epoch_callback(bin_idx_train, bin_counts_train,
     return epoch_callback
 
 
-def make_post_epoch_callback(bin_idx_val, bin_counts_val,
+def make_post_epoch_callback(bin_state_val,
                              tau_max, cap_per_bin=1000,
                              young_val_indices=None,
                              reference_bin_count=None,
@@ -625,8 +637,7 @@ def make_post_epoch_callback(bin_idx_val, bin_counts_val,
     def post_epoch_callback(trainer, epoch, total_epochs):
         # --- τ_max validation ---
         val_indices_taumax, val_weights_taumax = build_epoch_indices(
-            bin_idx_val,
-            bin_counts_val,
+            bin_state_val,
             tau_max,
             cap_per_bin,
             rng,
@@ -1047,12 +1058,12 @@ def main():
     )
     bin_idx_train = bin_idx_all[train_indices]
     bin_idx_val = bin_idx_all[val_indices]
-    bin_counts_train = np.bincount(bin_idx_train, minlength=n_joint_bins).astype(np.float64)
-    bin_counts_val = np.bincount(bin_idx_val, minlength=n_joint_bins).astype(np.float64)
+    bin_state_train = prepare_joint_bin_sampling_state(bin_idx_train, n_joint_bins)
+    bin_state_val = prepare_joint_bin_sampling_state(bin_idx_val, n_joint_bins)
     print(
         f'  Curriculum bins: age={args.n_bins}, mass={args.n_mass_bins}, '
         f'joint={n_joint_bins} '
-        f'(active train/val={(bin_counts_train > 0).sum()}/{(bin_counts_val > 0).sum()})'
+        f'(active train/val={bin_state_train["n_active"]}/{bin_state_val["n_active"]})'
     )
     print(f'  Curriculum split: train={len(train_indices):,}, val={len(val_indices):,}')
 
@@ -1147,10 +1158,8 @@ def main():
 
     # ---- Epoch callback (curriculum) ----
     epoch_cb = make_epoch_callback(
-        bin_idx_train=bin_idx_train,
-        bin_counts_train=bin_counts_train,
-        bin_idx_val=bin_idx_val,
-        bin_counts_val=bin_counts_val,
+        bin_state_train=bin_state_train,
+        bin_state_val=bin_state_val,
         tau_max=args.tau_max,
         tau_warmup=args.tau_warmup,
         cap_per_bin=args.cap_per_bin,
@@ -1169,8 +1178,7 @@ def main():
     print(f'  Young val stars (logAge < 7.8): {len(young_val_indices):,}')
 
     post_epoch_cb = make_post_epoch_callback(
-        bin_idx_val=bin_idx_val,
-        bin_counts_val=bin_counts_val,
+        bin_state_val=bin_state_val,
         tau_max=args.tau_max,
         cap_per_bin=args.cap_per_bin,
         young_val_indices=young_val_indices,
