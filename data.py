@@ -35,6 +35,7 @@ class SBIArrays:
     input_errors: np.ndarray
     input_observed: np.ndarray
     theta: np.ndarray
+    sample_weights: np.ndarray | None = None
 
 
 def parse_column_csv(text: str) -> list[str]:
@@ -152,6 +153,10 @@ class SBIDataset(Dataset):
         self.errors = torch.tensor(arrays.input_errors, dtype=torch.float32)
         self.observed = torch.tensor(arrays.input_observed, dtype=torch.float32)
         self.theta = torch.tensor(arrays.theta, dtype=torch.float32)
+        if arrays.sample_weights is None:
+            self.sample_weight = torch.ones(self.inputs.shape[0], dtype=torch.float32)
+        else:
+            self.sample_weight = torch.tensor(arrays.sample_weights, dtype=torch.float32)
 
     def __len__(self) -> int:
         return self.inputs.shape[0]
@@ -162,4 +167,5 @@ class SBIDataset(Dataset):
             "errors": self.errors[idx],
             "observed": self.observed[idx],
             "theta": self.theta[idx],
+            "sample_weight": self.sample_weight[idx],
         }

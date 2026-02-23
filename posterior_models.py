@@ -65,6 +65,7 @@ class ConditionalFMPosterior(nn.Module):
         values: torch.Tensor,       # (B, N)
         errors: torch.Tensor,       # (B, N)
         observed_mask: torch.Tensor,  # (B, N)
+        sample_weights: torch.Tensor | None = None,  # (B,)
     ) -> torch.Tensor:
         B = theta.shape[0]
         ctx = self.encoder(values, errors, observed_mask)
@@ -77,7 +78,12 @@ class ConditionalFMPosterior(nn.Module):
 
         v_tgt = theta - k * x0
         v_pred = self.predict_velocity(theta_t, t, ctx)
-        return (v_pred - v_tgt).pow(2).mean()
+        per_sample = (v_pred - v_tgt).pow(2).mean(dim=1)
+        if sample_weights is None:
+            return per_sample.mean()
+        w = sample_weights.to(per_sample.dtype).reshape(-1)
+        denom = w.sum().clamp_min(1e-8)
+        return (per_sample * w).sum() / denom
 
     @torch.no_grad()
     def sample(
@@ -251,8 +257,14 @@ class ConditionalFlowPosterior(nn.Module):
         values: torch.Tensor,
         errors: torch.Tensor,
         observed_mask: torch.Tensor,
+        sample_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.nll(theta, values, errors, observed_mask).mean()
+        nll = self.nll(theta, values, errors, observed_mask)
+        if sample_weights is None:
+            return nll.mean()
+        w = sample_weights.to(nll.dtype).reshape(-1)
+        denom = w.sum().clamp_min(1e-8)
+        return (nll * w).sum() / denom
 
     @torch.no_grad()
     def sample(

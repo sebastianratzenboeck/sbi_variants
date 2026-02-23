@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 # Support both:
 #   python -m sbi_variants.train_sbi_posterior
@@ -76,6 +76,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-stars", type=int, default=None,
                    help="Optional cap on train+val rows after exclusions.")
     p.add_argument("--seed", type=int, default=42)
+
+    # Joint curriculum / importance weighting
+    p.add_argument("--joint-curriculum", action="store_true", default=False,
+                   help="Enable joint (logAge,m_init) curriculum sampling q=(1-lambda)p+lambda/K.")
+    p.add_argument("--n-bins", type=int, default=25,
+                   help="Number of logAge bins for joint curriculum.")
+    p.add_argument("--n-mass-bins", type=int, default=12,
+                   help="Number of m_init bins for joint curriculum.")
+    p.add_argument("--tau-max", type=float, default=0.8,
+                   help="Max tau in curriculum schedule (tau=0 => uniform bins, tau=1 => natural bins).")
+    p.add_argument("--tau-warmup", type=int, default=10,
+                   help="Epochs to keep tau=0 before ramping to tau-max.")
+    p.add_argument("--curriculum-epoch-size", type=int, default=0,
+                   help="Samples drawn per epoch when joint curriculum is enabled (0 => len(train)).")
+    p.add_argument("--importance-weighting", action="store_true", default=False,
+                   help="Apply p/q importance correction in loss for curriculum-sampled batches.")
+    p.add_argument("--importance-weight-min", type=float, default=0.5)
+    p.add_argument("--importance-weight-max", type=float, default=2.0)
 
     # Encoder
     p.add_argument("--dim-value", type=int, default=24)
@@ -166,7 +184,108 @@ def parse_args() -> argparse.Namespace:
             "Missing required arguments after applying config/CLI: "
             + ", ".join(missing)
         )
+    if args.n_bins <= 0:
+        parser.error(f"--n-bins must be > 0, got {args.n_bins}")
+    if args.n_mass_bins <= 0:
+        parser.error(f"--n-mass-bins must be > 0, got {args.n_mass_bins}")
+    if args.curriculum_epoch_size < 0:
+        parser.error(
+            f"--curriculum-epoch-size must be >= 0, got {args.curriculum_epoch_size}"
+        )
+    if args.importance_weight_min <= 0:
+        parser.error(
+            f"--importance-weight-min must be > 0, got {args.importance_weight_min}"
+        )
+    if args.importance_weight_max < args.importance_weight_min:
+        parser.error(
+            "--importance-weight-max must be >= --importance-weight-min "
+            f"({args.importance_weight_max} < {args.importance_weight_min})"
+        )
     return args
+
+
+def _compute_tau(epoch: int, total_epochs: int, tau_max: float, tau_warmup: int) -> float:
+    if epoch < tau_warmup:
+        return 0.0
+    ramp_epochs = total_epochs - tau_warmup
+    if ramp_epochs <= 0:
+        return float(tau_max)
+    progress = (epoch - tau_warmup) / float(ramp_epochs)
+    return float(tau_max) * min(max(progress, 0.0), 1.0)
+
+
+def _prepare_joint_curriculum_state(
+    theta: np.ndarray,
+    theta_columns: list[str],
+    n_age_bins: int,
+    n_mass_bins: int,
+) -> dict[str, np.ndarray | float | int]:
+    try:
+        age_idx = theta_columns.index("logAge")
+        mass_idx = theta_columns.index("m_init")
+    except ValueError as e:
+        raise ValueError(
+            "Joint curriculum requires theta_columns to include both 'logAge' and 'm_init'."
+        ) from e
+
+    age = theta[:, age_idx]
+    mass = theta[:, mass_idx]
+    age_edges = np.linspace(age.min(), age.max() + 1e-6, n_age_bins + 1)
+    mass_edges = np.linspace(mass.min(), mass.max() + 1e-6, n_mass_bins + 1)
+
+    age_bin = np.digitize(age, age_edges) - 1
+    mass_bin = np.digitize(mass, mass_edges) - 1
+    age_bin = np.clip(age_bin, 0, n_age_bins - 1)
+    mass_bin = np.clip(mass_bin, 0, n_mass_bins - 1)
+
+    joint = age_bin * n_mass_bins + mass_bin
+    n_joint_bins = int(n_age_bins * n_mass_bins)
+    counts = np.bincount(joint, minlength=n_joint_bins).astype(np.float64)
+    active = counts > 0
+    if active.sum() == 0:
+        raise ValueError("Joint curriculum found no active bins.")
+
+    p_bin = np.zeros_like(counts, dtype=np.float64)
+    p_bin[active] = counts[active] / counts[active].sum()
+    return {
+        "joint": joint.astype(np.int64),
+        "counts": counts,
+        "p_bin": p_bin,
+        "active": active,
+        "n_active": int(active.sum()),
+    }
+
+
+def _joint_curriculum_distributions(
+    state: dict[str, np.ndarray | float | int],
+    tau: float,
+    *,
+    importance_weighting: bool,
+    importance_weight_min: float,
+    importance_weight_max: float,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    joint = state["joint"]
+    counts = state["counts"]
+    p_bin = state["p_bin"]
+    active = state["active"]
+    n_active = int(state["n_active"])
+
+    lam = float(np.clip(1.0 - tau, 0.0, 1.0))
+    q_bin = np.zeros_like(p_bin, dtype=np.float64)
+    q_bin[active] = (1.0 - lam) * p_bin[active] + lam * (1.0 / float(n_active))
+
+    q_i = q_bin[joint] / counts[joint]
+    q_i = q_i / q_i.sum()
+
+    if importance_weighting:
+        w_i = (p_bin[joint] / q_bin[joint]).astype(np.float32)
+        w_i /= max(float(w_i.mean()), 1e-8)
+        w_i = np.clip(w_i, float(importance_weight_min), float(importance_weight_max)).astype(np.float32)
+        w_i /= max(float(w_i.mean()), 1e-8)
+    else:
+        w_i = np.ones_like(q_i, dtype=np.float32)
+
+    return q_i.astype(np.float64), w_i, lam
 
 
 def _build_model(args: argparse.Namespace, input_columns: list[str], theta_dim: int) -> torch.nn.Module:
@@ -242,6 +361,7 @@ def _epoch_loss(
                     values=batch["inputs"],
                     errors=batch["errors"],
                     observed_mask=batch["observed"],
+                    sample_weights=batch.get("sample_weight"),
                 )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -256,6 +376,7 @@ def _epoch_loss(
                         values=batch["inputs"],
                         errors=batch["errors"],
                         observed_mask=batch["observed"],
+                        sample_weights=batch.get("sample_weight"),
                     )
         total += float(loss.item())
         n_batches += 1
@@ -306,14 +427,37 @@ def main() -> None:
     train_ds = SBIDataset(arr_train)
     val_ds = SBIDataset(arr_val)
     pin_memory = (device != "cpu" and torch.cuda.is_available())
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=True,
-        num_workers=args.num_workers,
-        pin_memory=pin_memory,
-    )
+    if args.joint_curriculum:
+        curriculum_state = _prepare_joint_curriculum_state(
+            theta=arr_train.theta,
+            theta_columns=theta_columns,
+            n_age_bins=args.n_bins,
+            n_mass_bins=args.n_mass_bins,
+        )
+        n_train_samples_per_epoch = (
+            int(args.curriculum_epoch_size)
+            if args.curriculum_epoch_size > 0
+            else int(len(train_ds))
+        )
+        print(
+            "Joint curriculum enabled: "
+            f"age_bins={args.n_bins}, mass_bins={args.n_mass_bins}, "
+            f"active_bins={curriculum_state['n_active']}, "
+            f"epoch_samples={n_train_samples_per_epoch}, "
+            f"importance_weighting={args.importance_weighting}"
+        )
+        train_loader = None
+    else:
+        curriculum_state = None
+        n_train_samples_per_epoch = int(len(train_ds))
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+        )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
@@ -367,9 +511,47 @@ def main() -> None:
 
     t0 = time.time()
     for epoch in range(args.epochs):
+        curriculum_log = {}
+        if args.joint_curriculum:
+            tau = _compute_tau(epoch, args.epochs, args.tau_max, args.tau_warmup)
+            q_i, w_i, lam = _joint_curriculum_distributions(
+                curriculum_state,
+                tau=tau,
+                importance_weighting=args.importance_weighting,
+                importance_weight_min=args.importance_weight_min,
+                importance_weight_max=args.importance_weight_max,
+            )
+            train_ds.sample_weight = torch.from_numpy(w_i.astype(np.float32))
+            sampler_gen = torch.Generator()
+            sampler_gen.manual_seed(int(args.seed + epoch))
+            sampler = WeightedRandomSampler(
+                weights=torch.from_numpy(q_i),
+                num_samples=n_train_samples_per_epoch,
+                replacement=True,
+                generator=sampler_gen,
+            )
+            epoch_train_loader = DataLoader(
+                train_ds,
+                batch_size=args.batch_size,
+                sampler=sampler,
+                shuffle=False,
+                drop_last=True,
+                num_workers=args.num_workers,
+                pin_memory=pin_memory,
+            )
+            curriculum_log = {
+                "tau": float(tau),
+                "mixture_lambda": float(lam),
+                "train_importance_weight_min": float(w_i.min()),
+                "train_importance_weight_mean": float(w_i.mean()),
+                "train_importance_weight_max": float(w_i.max()),
+            }
+        else:
+            epoch_train_loader = train_loader
+
         train_loss = _epoch_loss(
             model,
-            train_loader,
+            epoch_train_loader,
             device,
             train=True,
             optimizer=optimizer,
@@ -399,15 +581,23 @@ def main() -> None:
             f"Epoch {epoch + 1:04d}/{args.epochs} "
             f"train_loss={train_loss:.6f} val_loss={val_loss:.6f} lr={lr:.2e}"
         )
-        if wandb_run is not None:
-            wandb_run.log(
-                {
-                    "epoch": epoch + 1,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "lr": lr,
-                }
+        if args.joint_curriculum:
+            print(
+                f"  curriculum: tau={curriculum_log['tau']:.3f}, "
+                f"lambda={curriculum_log['mixture_lambda']:.3f}, "
+                f"w[min/mean/max]={curriculum_log['train_importance_weight_min']:.3f}/"
+                f"{curriculum_log['train_importance_weight_mean']:.3f}/"
+                f"{curriculum_log['train_importance_weight_max']:.3f}"
             )
+        if wandb_run is not None:
+            payload = {
+                "epoch": epoch + 1,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "lr": lr,
+            }
+            payload.update(curriculum_log)
+            wandb_run.log(payload)
 
         if val_loss < best_val:
             best_val = float(val_loss)
