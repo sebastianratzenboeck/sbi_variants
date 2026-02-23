@@ -4,6 +4,12 @@
 # Allow traversing directories
 !*/
 
+# IDE metadata
+.idea/
+
+# Local experiment artifacts
+wandb/
+
 # Track Python source files only
 !*.py
 !*.json
