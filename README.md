@@ -96,6 +96,15 @@ python train_variant_sbi_nf_theta.py \
   --run-name nf_obs_to_theta
 ```
 
+Data-path-only workflow (cache is created automatically at `output_dir/build_arrays_cache.npz`):
+
+```bash
+python train_variant_sbi_nf_theta.py \
+  --data-path /path/to/galaxy_field_clusters_all_processed.parquet \
+  --output-dir /path/to/output \
+  --run-name nf_obs_to_theta
+```
+
 Compatibility note: `--method realnvp` is kept as an alias for `normalizing_flow`.
 
 ## Joint curriculum + importance correction
@@ -157,10 +166,9 @@ Example (NF + zuko, cluster-aware test holdout):
 ```bash
 python train_sbi_posterior.py \
   --config configs/train_nf_zuko_theta.json \
-  --cache-path /path/to/build_arrays_cache.npz \
+  --data-path /path/to/galaxy_field_clusters_all_processed.parquet \
   --output-dir /path/to/output \
   --run-name nf_zuko_cluster_holdout \
-  --exclude-indices none \
   --test-split 0.05 \
   --test-cluster-frac 0.2 \
   --wandb \

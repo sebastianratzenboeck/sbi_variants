@@ -48,7 +48,7 @@
   "patience": 60,
   "num_workers": 0,
   "amp": true,
-  "compile": false,
+  "compile": true,
   "device": "cuda",
   "wandb": false,
   "wandb_project": "mock-galaxy-simformer"

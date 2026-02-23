@@ -38,6 +38,12 @@ from sbi_variants.posterior_models import (
     ConditionalFMPosterior,
     ConditionalFlowPosterior,
 )
+from train_mock_galaxy import (
+    DEFAULT_CLUSTER_ID_COL,
+    build_arrays as build_cache_arrays,
+    load_data as load_raw_data,
+    save_arrays as save_cache_arrays,
+)
 
 try:
     from torch.amp import GradScaler, autocast
@@ -61,6 +67,15 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Optional JSON config file. CLI flags override config values.")
     p.add_argument("--cache-path", type=str, default=None,
                    help="Path to build_arrays_cache.npz.")
+    p.add_argument(
+        "--data-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional Parquet/CSV path used to build cache arrays when --cache-path "
+            "is missing or --rebuild-cache is enabled."
+        ),
+    )
     p.add_argument("--output-dir", type=str, default=None,
                    help="Output directory for checkpoints/configs.")
     p.add_argument("--run-name", type=str, default="sbi_variant")
@@ -73,6 +88,21 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Comma-separated theta columns to model in posterior.")
     p.add_argument("--exclude-indices", type=str, default=None,
                    help="Optional .npy indices excluded from train/val (e.g. test_indices.npy).")
+    p.add_argument(
+        "--cluster-id-col",
+        type=str,
+        default=DEFAULT_CLUSTER_ID_COL,
+        help=(
+            "Cluster ID column used only when building cache from --data-path "
+            "(stored as metadata for cluster-aware test holdout)."
+        ),
+    )
+    p.add_argument(
+        "--rebuild-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Force rebuilding cache from --data-path even if cache file exists.",
+    )
     p.add_argument(
         "--test-split",
         type=float,
@@ -204,14 +234,20 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
 
+    if isinstance(args.cache_path, str):
+        cache_norm = args.cache_path.strip().lower()
+        if cache_norm in ("", "none", "null"):
+            args.cache_path = None
+    if isinstance(args.data_path, str):
+        data_norm = args.data_path.strip().lower()
+        if data_norm in ("", "none", "null"):
+            args.data_path = None
     if isinstance(args.exclude_indices, str):
         norm = args.exclude_indices.strip().lower()
         if norm in ("", "none", "null"):
             args.exclude_indices = None
 
     missing = []
-    if not args.cache_path:
-        missing.append("--cache-path")
     if not args.output_dir:
         missing.append("--output-dir")
     if missing:
@@ -241,6 +277,54 @@ def parse_args() -> argparse.Namespace:
             f"({args.importance_weight_max} < {args.importance_weight_min})"
         )
     return args
+
+
+def _ensure_cache(args: argparse.Namespace) -> str:
+    """Return an existing cache path or build cache from raw data if needed."""
+    cache_path = args.cache_path
+    if cache_path is None:
+        cache_path = os.path.join(args.output_dir, "build_arrays_cache.npz")
+    cache_path = os.path.abspath(cache_path)
+
+    if os.path.exists(cache_path) and not args.rebuild_cache:
+        print(f"Using cache: {cache_path}")
+        return cache_path
+
+    if args.data_path is None:
+        raise ValueError(
+            "Cache file is missing (or rebuild requested) but --data-path is not set. "
+            "Provide --data-path to build cache, or pass an existing --cache-path."
+        )
+
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+    print(f"Building cache at {cache_path} from raw data: {args.data_path}")
+    df = load_raw_data(args.data_path)
+    (
+        values_norm,
+        errors_norm,
+        observed_mask,
+        means,
+        stds,
+        value_transform_names,
+        value_transform_params,
+        cluster_ids,
+        log_err_mean,
+        log_err_std,
+    ) = build_cache_arrays(df, cluster_id_col=args.cluster_id_col)
+    save_cache_arrays(
+        cache_path,
+        values_norm,
+        errors_norm,
+        observed_mask,
+        means,
+        stds,
+        value_transform_names,
+        value_transform_params,
+        cluster_ids,
+        log_err_mean,
+        log_err_std,
+    )
+    return cache_path
 
 
 def _compute_tau(epoch: int, total_epochs: int, tau_max: float, tau_warmup: int) -> float:
@@ -512,7 +596,9 @@ def main() -> None:
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    cache = load_cache_arrays(args.cache_path)
+    cache_path = _ensure_cache(args)
+    args.cache_path = cache_path
+    cache = load_cache_arrays(cache_path)
     input_columns = parse_column_csv(args.input_columns)
     theta_columns = parse_column_csv(args.theta_columns)
     if len(input_columns) == 0:

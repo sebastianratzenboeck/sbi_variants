@@ -1,5 +1,6 @@
 {
-  "cache_path": "/path/to/build_arrays_cache.npz",
+  "cache_path": null,
+  "data_path": null,
   "output_dir": "/path/to/output_sbi_variants",
   "run_name": "sbi_nf_zuko_theta",
   "method": "normalizing_flow",
@@ -46,7 +47,7 @@
   "patience": 60,
   "num_workers": 0,
   "amp": true,
-  "compile": false,
+  "compile": true,
   "device": "cuda",
   "wandb": false,
   "wandb_project": "mock-galaxy-simformer"
