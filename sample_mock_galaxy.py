@@ -1,0 +1,605 @@
+#!/usr/bin/env python
+"""
+Sample from a trained SimFormer model for galaxy posterior inference.
+
+Given observed photometric data (magnitudes, parallax, etc.), generate
+posterior samples for intrinsic stellar parameters (age, metallicity,
+mass, luminosity, ...) and true (noise-free) magnitudes.
+
+Usage:
+  # Sample posteriors for stars in a CSV/Parquet file
+  python sample_mock_galaxy.py --model-dir ./output --run-name myrun --obs-file stars.parquet
+
+  # More posterior draws, finer ODE integration, on GPU
+  python sample_mock_galaxy.py --model-dir ./output --run-name myrun --obs-file stars.parquet \\
+      --num-samples 2000 --steps 128 --batch-size 1024 --device cuda
+
+  # Output to a specific file
+  python sample_mock_galaxy.py --model-dir ./output --run-name myrun --obs-file stars.parquet \\
+      --output posteriors.parquet
+
+  # Sample directly from cached arrays (uses model-dir/test_indices.npy if present)
+  python sample_mock_galaxy.py --model-dir ./test_info --run-name fixed_validation \\
+      --cache-path ./test_info/build_arrays_cache.npz
+"""
+
+import argparse
+import inspect
+import json
+import os
+import time
+
+import numpy as np
+import pandas as pd
+import torch
+
+from columns import (
+    INTRINSIC_COLS, OBS_COLS, OBS_ERR_COLS, ALL_VALUE_COLS,
+)
+from prepare_data import galactic_to_unitvec
+from transformer import Simformer
+from inference_utils import NormStats
+from sampling import (
+    build_inference_edge_mask,
+    build_inference_condition_mask,
+    build_inference_node_ids,
+    sample_batched_flow,
+)
+
+# Keep observed errors strictly positive so they are always treated as real
+# measurements by log-error normalization.
+OBS_ERROR_FLOOR = 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+
+def _simformer_kwargs_from_config(config):
+    """Extract only Simformer ctor args from a possibly richer config dict."""
+    sig = inspect.signature(Simformer.__init__)
+    valid = set(sig.parameters.keys()) - {"self"}
+    return {k: v for k, v in config.items() if k in valid}
+
+def _upgrade_legacy_binary_state_embeddings(state_dict):
+    """Upgrade legacy 1-vector mask embeddings to 2-state embedding tables.
+
+    Legacy checkpoints store:
+      - tokenizer.cond_embed.condition_embedding   shape (1, 1, D)
+      - tokenizer.observed_embed.observed_embedding shape (1, 1, D)
+
+    New tokenizer expects:
+      - shape (2, D), row 0=off, row 1=on
+    """
+    upgrades = [
+        ("tokenizer.cond_embed.condition_embedding", "condition"),
+        ("tokenizer.observed_embed.observed_embedding", "observed"),
+    ]
+    for key, name in upgrades:
+        if key not in state_dict:
+            continue
+        w = state_dict[key]
+        if w.ndim == 2 and w.shape[0] == 2:
+            continue  # already new format
+
+        on_vec = None
+        if w.ndim == 3 and w.shape[0] == 1 and w.shape[1] == 1:
+            on_vec = w[0, 0]
+        elif w.ndim == 2 and w.shape[0] == 1:
+            on_vec = w[0]
+
+        if on_vec is None:
+            continue
+
+        new_w = torch.zeros((2, on_vec.shape[0]), dtype=on_vec.dtype, device=on_vec.device)
+        new_w[1] = on_vec
+        state_dict[key] = new_w
+        print(f"  Upgraded legacy {name} embedding checkpoint tensor to 2-state table.")
+
+
+def load_model(model_dir, run_name="default", device="cpu"):
+    """Load a trained SimFormer model and normalization statistics.
+
+    Args:
+        model_dir: Directory containing model config, checkpoint, and norm stats.
+        run_name: Run name used during training (determines checkpoint and config filenames).
+        device: Target device.
+
+    Returns:
+        model: Simformer model with loaded weights.
+        norm_stats: NormStats instance.
+    """
+    # Load architecture config saved during training
+    config_path = os.path.join(model_dir, f"model_config_{run_name}.json")
+    with open(config_path) as f:
+        config = json.load(f)
+    print(f"  Model config loaded from {config_path}")
+    model = Simformer(**_simformer_kwargs_from_config(config))
+
+    ckpt_path = os.path.join(model_dir, f"best_model_{run_name}.pt")
+    state_dict = torch.load(ckpt_path, map_location=device, weights_only=True)
+    # Handle checkpoints saved from torch.compile, where keys are prefixed
+    # with "_orig_mod." (e.g. "_orig_mod.tokenizer...").
+    if state_dict and all(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        state_dict = {k[len("_orig_mod."):]: v for k, v in state_dict.items()}
+    _upgrade_legacy_binary_state_embeddings(state_dict)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+
+    norm_stats = NormStats(os.path.join(model_dir, "norm_stats.npz"))
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  Model loaded: {n_params:,} parameters from {ckpt_path}")
+    return model, norm_stats
+
+
+# ---------------------------------------------------------------------------
+# Observation preparation
+# ---------------------------------------------------------------------------
+
+def prepare_observations(obs_df, norm_stats, device="cpu", model_columns=None):
+    """Convert raw observations into model-ready tensors.
+
+    Each row of *obs_df* represents one star. Columns should match OBS_COLS
+    (with NaN for unobserved bands) and optionally OBS_ERR_COLS.
+
+    Sky coordinates (glon, glat) are converted to 3D unit vectors
+    (sky_ux, sky_uy, sky_uz) and always conditioned on.
+    Other intrinsic and true-magnitude columns are left as unobserved (NaN)
+    since those are what we want to infer.
+
+    Args:
+        obs_df: DataFrame with observed columns (subset of OBS_COLS / OBS_ERR_COLS).
+            Must also contain 'glon' and 'glat' columns (will be converted
+            to unit vectors internally).
+        norm_stats: NormStats instance from training.
+        device: Target device.
+
+    Returns:
+        condition_values: (N_stars, M) float tensor — normalized,
+            NaN filled with 0.
+        condition_mask: (N_stars, M, 1) float tensor — 1 for
+            conditioned (observed) dims.
+        observed_mask: (N_stars, M) float tensor — 1 for observed dims.
+        errors: (N_stars, M) float tensor — log-normalized measurement
+            errors with sentinels (-5 perfect, +5 unobserved).
+    """
+    model_columns = list(model_columns) if model_columns is not None else [str(c) for c in norm_stats.columns]
+    col_to_idx = {c: i for i, c in enumerate(model_columns)}
+    M = len(model_columns)
+    N_stars = len(obs_df)
+
+    # --- Value array: active model columns ---
+    values_raw = np.full((N_stars, M), np.nan, dtype=np.float32)
+
+    # Fill directly provided columns that are part of model layout.
+    for col in model_columns:
+        if col in obs_df.columns:
+            values_raw[:, col_to_idx[col]] = obs_df[col].values.astype(np.float32)
+
+    # Sky unit vector — use precomputed columns if available, else convert glon/glat
+    sky_cols = ['sky_ux', 'sky_uy', 'sky_uz']
+    present_sky_cols = [c for c in sky_cols if c in col_to_idx]
+    if present_sky_cols and all(c in obs_df.columns for c in sky_cols):
+        for name in sky_cols:
+            if name in col_to_idx:
+                values_raw[:, col_to_idx[name]] = obs_df[name].values.astype(np.float32)
+    elif present_sky_cols and ('glon' in obs_df.columns and 'glat' in obs_df.columns):
+        ux, uy, uz = galactic_to_unitvec(
+            obs_df['glon'].values, obs_df['glat'].values
+        )
+        for name, vals in [('sky_ux', ux), ('sky_uy', uy), ('sky_uz', uz)]:
+            if name in col_to_idx:
+                values_raw[:, col_to_idx[name]] = vals.astype(np.float32)
+    elif present_sky_cols:
+        raise ValueError(
+            "Observation file must contain either (sky_ux, sky_uy, sky_uz) "
+            "or (glon, glat) columns for sky position."
+        )
+
+    # --- Masks ---
+    obs_cols_in_model = [c for c in model_columns if c in OBS_COLS]
+    observed_mask = np.ones((N_stars, M), dtype=np.float32)
+    for c in obs_cols_in_model:
+        observed_mask[:, col_to_idx[c]] = 0.0
+
+    # Condition-mask semantics are independent from observed-mask semantics:
+    # condition only on known inputs (sky + available observed measurements).
+    condition_mask = np.zeros((N_stars, M), dtype=np.float32)
+
+    for col in obs_cols_in_model:
+        col_idx = col_to_idx[col]
+        is_obs = ~np.isnan(values_raw[:, col_idx])
+        observed_mask[:, col_idx] = is_obs.astype(np.float32)
+        condition_mask[:, col_idx] = is_obs.astype(np.float32)
+
+    # Sky unit vector components are always observed and conditioned
+    for col in ['sky_ux', 'sky_uy', 'sky_uz']:
+        if col in col_to_idx:
+            col_idx = col_to_idx[col]
+            observed_mask[:, col_idx] = 1.0
+            condition_mask[:, col_idx] = 1.0
+
+    # --- Errors array ---
+    errors_raw = np.zeros((N_stars, M), dtype=np.float32)
+    for c in obs_cols_in_model:
+        errors_raw[:, col_to_idx[c]] = np.nan
+
+    obs_to_err = dict(zip(OBS_COLS, OBS_ERR_COLS))
+    for obs_col in obs_cols_in_model:
+        err_col = obs_to_err[obs_col]
+        col_idx = col_to_idx[obs_col]
+        if err_col in obs_df.columns:
+            err_vals = obs_df[err_col].values.astype(np.float32)
+            # Keep error undefined where observation is missing.
+            is_obs = ~np.isnan(values_raw[:, col_idx])
+            err_vals = np.where(is_obs, err_vals, np.nan).astype(np.float32)
+            # For observed entries, floor non-positive/non-finite errors so they
+            # are log-scaled as real measurements (including parallax_err).
+            bad = is_obs & (~np.isfinite(err_vals) | (err_vals <= 0.0))
+            if bad.any():
+                err_vals[bad] = OBS_ERROR_FLOOR
+            errors_raw[:, col_idx] = err_vals
+    # Sky unit vector errors are effectively zero (perfectly known).
+
+    # --- Normalize errors (log-transform + standardize with sentinels) ---
+    errors_norm = norm_stats.normalize_errors(errors_raw)
+
+    # --- Normalize values ---
+    values_norm = norm_stats.normalize_numpy(values_raw)
+    values_norm = np.nan_to_num(values_norm, nan=0.0)
+
+    # --- Convert to tensors ---
+    condition_values = torch.tensor(values_norm, dtype=torch.float32, device=device)
+    condition_mask = torch.tensor(condition_mask, dtype=torch.float32, device=device).unsqueeze(-1)
+    observed_mask = torch.tensor(observed_mask, dtype=torch.float32, device=device)
+    errors = torch.tensor(errors_norm, dtype=torch.float32, device=device)
+
+    return condition_values, condition_mask, observed_mask, errors
+
+
+def prepare_observations_from_cache(
+    cache_path,
+    indices=None,
+    max_stars=None,
+    expected_columns=None,
+    device="cpu",
+):
+    """Load normalized inputs directly from build_arrays_cache.npz.
+
+    Returns tensors ready for sample_posterior() and the selected row indices.
+    """
+    d = np.load(cache_path, allow_pickle=True)
+
+    expected_columns = list(expected_columns) if expected_columns is not None else list(ALL_VALUE_COLS)
+    cached_cols = list(d["columns"]) if "columns" in d else list(ALL_VALUE_COLS)
+    cached_to_idx = {c: i for i, c in enumerate(cached_cols)}
+    missing = [c for c in expected_columns if c not in cached_to_idx]
+    if missing:
+        raise ValueError(
+            f"Cache {cache_path} is missing expected columns: {missing[:5]}"
+            + ("..." if len(missing) > 5 else "")
+        )
+    col_idx = np.asarray([cached_to_idx[c] for c in expected_columns], dtype=np.int64)
+
+    values_norm = d["values_norm"].astype(np.float32)[:, col_idx]
+    errors_norm = d["errors_norm"].astype(np.float32)[:, col_idx]
+    observed_mask = d["observed_mask"].astype(np.float32)[:, col_idx]
+
+    n_total = values_norm.shape[0]
+    if indices is None:
+        selected = np.arange(n_total, dtype=np.int64)
+    else:
+        selected = np.asarray(indices, dtype=np.int64)
+
+    if max_stars is not None:
+        selected = selected[:max_stars]
+
+    if selected.size == 0:
+        raise ValueError("No rows selected from cache.")
+    if selected.min() < 0 or selected.max() >= n_total:
+        raise ValueError(f"Selected indices are out of bounds for cache with {n_total} rows.")
+
+    values_norm = values_norm[selected]
+    errors_norm = errors_norm[selected]
+    observed_mask = observed_mask[selected]
+
+    # Match inference semantics: condition only on observed obs-block + sky.
+    condition_mask = np.zeros_like(observed_mask, dtype=np.float32)
+    for i, c in enumerate(expected_columns):
+        if c in OBS_COLS:
+            condition_mask[:, i] = observed_mask[:, i]
+    for col in ["sky_ux", "sky_uy", "sky_uz"]:
+        if col in expected_columns:
+            condition_mask[:, expected_columns.index(col)] = 1.0
+
+    condition_values = torch.tensor(values_norm, dtype=torch.float32, device=device)
+    condition_mask = torch.tensor(condition_mask, dtype=torch.float32, device=device).unsqueeze(-1)
+    observed_mask = torch.tensor(observed_mask, dtype=torch.float32, device=device)
+    errors = torch.tensor(errors_norm, dtype=torch.float32, device=device)
+    return condition_values, condition_mask, observed_mask, errors, selected
+
+
+# ---------------------------------------------------------------------------
+# Posterior sampling
+# ---------------------------------------------------------------------------
+
+def sample_posterior(
+    model,
+    condition_values,
+    condition_mask,
+    observed_mask,
+    errors,
+    num_samples=512,
+    batch_size=512,
+    steps=128,
+    device="cpu",
+):
+    """Generate posterior samples for each star.
+
+    For each of the N_stars input observations, draws *num_samples*
+    independent posterior samples by running the flow from t=0 to t=1.
+
+    Args:
+        model: Trained Simformer model.
+        condition_values: (N_stars, NUM_NODES) normalized values.
+        condition_mask: (N_stars, NUM_NODES, 1) condition mask.
+        observed_mask: (N_stars, NUM_NODES) observed mask.
+        errors: (N_stars, NUM_NODES) measurement errors.
+        num_samples: Number of posterior draws per star.
+        batch_size: Maximum batch size for parallel sampling.
+        steps: Number of Euler integration steps.
+        device: Target device.
+
+    Returns:
+        all_samples: (N_stars, num_samples, NUM_NODES) tensor in normalized space.
+    """
+    N_stars = condition_values.shape[0]
+    M = condition_values.shape[1]
+    all_samples = torch.zeros(N_stars, num_samples, M, device="cpu")
+
+    for star_idx in range(N_stars):
+        print(f"  Sampling star {star_idx + 1}/{N_stars} "
+              f"({num_samples} draws, {steps} steps) ...")
+
+        # Replicate this star's data num_samples times
+        cv = condition_values[star_idx].unsqueeze(0).expand(num_samples, -1)  # (S, M)
+        cm = condition_mask[star_idx].unsqueeze(0).expand(num_samples, -1, -1)  # (S, M, 1)
+        om = observed_mask[star_idx].unsqueeze(0).expand(num_samples, -1)   # (S, M)
+        er = errors[star_idx].unsqueeze(0).expand(num_samples, -1)          # (S, M)
+
+        # Process in chunks of batch_size
+        star_samples = []
+        for chunk_start in range(0, num_samples, batch_size):
+            chunk_end = min(chunk_start + batch_size, num_samples)
+            B = chunk_end - chunk_start
+
+            cv_chunk = cv[chunk_start:chunk_end].to(device)
+            cm_chunk = cm[chunk_start:chunk_end].to(device)
+            om_chunk = om[chunk_start:chunk_end].to(device)
+            er_chunk = er[chunk_start:chunk_end].to(device)
+
+            # Build inference masks
+            node_ids = build_inference_node_ids(B, M, device=device)
+            edge_mask = build_inference_edge_mask(B, M, observed_mask=om_chunk, device=device)
+
+            # Run flow
+            x = sample_batched_flow(
+                model_fn=model,
+                shape=(B,),
+                condition_mask=cm_chunk,
+                condition_values=cv_chunk,
+                node_ids=node_ids,
+                edge_masks=edge_mask,
+                errors=er_chunk,
+                observed_mask=om_chunk,
+                steps=steps,
+                device=device,
+            )  # (B, M, 1)
+
+            star_samples.append(x.squeeze(-1).cpu())  # (B, M)
+
+        all_samples[star_idx] = torch.cat(star_samples, dim=0)  # (num_samples, M)
+
+    return all_samples
+
+
+# ---------------------------------------------------------------------------
+# Output formatting
+# ---------------------------------------------------------------------------
+
+def samples_to_dataframe(all_samples, norm_stats, star_ids=None):
+    """Convert posterior samples to a long-format DataFrame.
+
+    Args:
+        all_samples: (N_stars, num_samples, NUM_NODES) tensor in normalized space.
+        norm_stats: NormStats instance for denormalization.
+        star_ids: Optional list/array of star identifiers.
+
+    Returns:
+        DataFrame with columns: [star_id, sample_idx, <column_names>...]
+    """
+    N_stars, num_samples, M = all_samples.shape
+
+    # Denormalize to physical units
+    samples_phys = norm_stats.denormalize(all_samples.view(-1, M)).view(N_stars, num_samples, M)
+    samples_np = samples_phys.numpy()
+
+    rows = []
+    for star_idx in range(N_stars):
+        sid = star_ids[star_idx] if star_ids is not None else star_idx
+        for sample_idx in range(num_samples):
+            row = {"star_id": sid, "sample_idx": sample_idx}
+            for col_idx, col_name in enumerate(norm_stats.columns):
+                row[col_name] = samples_np[star_idx, sample_idx, col_idx]
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Sample posteriors from trained SimFormer.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    p.add_argument("--model-dir", type=str, required=True,
+                   help="Directory with model checkpoint/config and norm_stats.npz")
+    p.add_argument("--run-name", type=str, default="default",
+                   help="Run name (matches training --run-name for config/checkpoint)")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--obs-file", type=str, default=None,
+                     help="CSV/Parquet with observed columns (_obs, _err)")
+    src.add_argument("--cache-path", type=str, default=None,
+                     help="Path to build_arrays_cache.npz for direct cached inference")
+    p.add_argument("--index-file", type=str, default=None,
+                   help="Optional .npy indices into --cache-path (e.g. test_indices.npy)")
+    p.add_argument("--num-samples", type=int, default=512,
+                   help="Number of posterior draws per star")
+    p.add_argument("--steps", type=int, default=128,
+                   help="Number of Euler ODE integration steps")
+    p.add_argument("--batch-size", type=int, default=512,
+                   help="Batch size for parallel sampling")
+    p.add_argument("--device", type=str, default=None,
+                   help="Device (auto-detect if not set)")
+    p.add_argument("--output", type=str, default=None,
+                   help="Output file path (default: <model-dir>/posteriors.parquet)")
+    p.add_argument("--max-stars", type=int, default=None,
+                   help="Limit number of stars to sample (for testing)")
+
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # Device
+    if args.device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = args.device
+    print(f"Using device: {device}")
+
+    # ---- Load model ----
+    print("\n--- Model ---")
+    model, norm_stats = load_model(args.model_dir, run_name=args.run_name, device=device)
+
+    # ---- Prepare inputs ----
+    print("\n--- Preparing inputs ---")
+    if args.cache_path is not None:
+        idx = None
+        if args.index_file is not None:
+            idx = np.load(args.index_file)
+            print(f"  Loaded {len(idx):,} row indices from {args.index_file}")
+        else:
+            default_idx = os.path.join(args.model_dir, "test_indices.npy")
+            if os.path.exists(default_idx):
+                idx = np.load(default_idx)
+                print(f"  Using test indices from {default_idx} ({len(idx):,} rows)")
+
+        condition_values, condition_mask, observed_mask, errors, selected_indices = \
+            prepare_observations_from_cache(
+                cache_path=args.cache_path,
+                indices=idx,
+                max_stars=args.max_stars,
+                expected_columns=list(norm_stats.columns),
+                device="cpu",
+            )
+        print(f"  Loaded {len(selected_indices):,} stars from cache {args.cache_path}")
+        star_ids = selected_indices
+    else:
+        print("\n--- Observations ---")
+        if args.obs_file.endswith(".parquet"):
+            obs_df = pd.read_parquet(args.obs_file)
+        else:
+            obs_df = pd.read_csv(args.obs_file)
+
+        if args.max_stars is not None:
+            obs_df = obs_df.head(args.max_stars)
+
+        print(f"  Loaded {len(obs_df)} stars from {args.obs_file}")
+
+        # Check which observed columns are present
+        model_obs_cols = [c for c in OBS_COLS if c in norm_stats.columns]
+        model_err_cols = [dict(zip(OBS_COLS, OBS_ERR_COLS))[c] for c in model_obs_cols]
+        present_obs = [c for c in model_obs_cols if c in obs_df.columns]
+        present_err = [c for c in model_err_cols if c in obs_df.columns]
+        print(f"  Observed columns found: {len(present_obs)}/{len(model_obs_cols)}")
+        print(f"  Error columns found:    {len(present_err)}/{len(model_err_cols)}")
+
+        if not present_obs:
+            raise ValueError(
+                f"No observed columns found in {args.obs_file}. "
+                f"Expected columns like: {OBS_COLS[:3]}"
+            )
+
+        condition_values, condition_mask, observed_mask, errors = \
+            prepare_observations(obs_df, norm_stats, device="cpu")
+        # Use an identifier column if available, otherwise use row index
+        star_ids = obs_df.index.values if obs_df.index.name else np.arange(len(obs_df))
+
+    # Summary
+    n_cond_per_star = condition_mask.squeeze(-1).sum(dim=1)
+    print(f"  Conditioned dims per star: "
+          f"min={n_cond_per_star.min():.0f}, "
+          f"max={n_cond_per_star.max():.0f}, "
+          f"mean={n_cond_per_star.mean():.1f}")
+    num_nodes = int(condition_mask.shape[1])
+    print(f"  Free dims per star (to be inferred): "
+          f"{num_nodes - n_cond_per_star.mean():.1f} on average")
+
+    # ---- Sample posteriors ----
+    print(f"\n--- Sampling ({args.num_samples} draws/star, {args.steps} steps) ---")
+    t0 = time.time()
+
+    all_samples = sample_posterior(
+        model=model,
+        condition_values=condition_values,
+        condition_mask=condition_mask,
+        observed_mask=observed_mask,
+        errors=errors,
+        num_samples=args.num_samples,
+        batch_size=args.batch_size,
+        steps=args.steps,
+        device=device,
+    )
+
+    elapsed = time.time() - t0
+    print(f"\n  Sampling completed in {elapsed:.1f}s "
+          f"({elapsed / len(star_ids):.2f}s/star)")
+
+    # ---- Save results ----
+    output_path = args.output or os.path.join(args.model_dir, "posteriors.parquet")
+
+    print(f"\n--- Saving results ---")
+    result_df = samples_to_dataframe(all_samples, norm_stats, star_ids=star_ids)
+    result_df.to_parquet(output_path, index=False)
+    print(f"  Posteriors saved to {output_path}")
+    print(f"  Shape: {result_df.shape[0]:,} rows "
+          f"({len(star_ids)} stars x {args.num_samples} samples)")
+
+    # ---- Summary statistics ----
+    print(f"\n--- Summary ---")
+    print(f"  Stars:      {len(star_ids)}")
+    print(f"  Samples:    {args.num_samples}/star")
+    print(f"  ODE steps:  {args.steps}")
+    print(f"  Total time: {elapsed:.1f}s")
+
+    # Print mean/std of inferred intrinsic params for the first star
+    if len(star_ids) > 0:
+        first_star = all_samples[0]  # (num_samples, NUM_NODES)
+        first_star_phys = norm_stats.denormalize(first_star)
+        print(f"\n  Posterior summary for first star:")
+        intrinsic_cols = [c for c in INTRINSIC_COLS if c in norm_stats.columns]
+        for col in intrinsic_cols:
+            i = norm_stats.column_index(col)
+            vals = first_star_phys[:, i].numpy()
+            print(f"    {col:>12s}: {vals.mean():10.4f} +/- {vals.std():.4f}")
+
+
+if __name__ == "__main__":
+    main()

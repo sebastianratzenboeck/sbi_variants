@@ -1,0 +1,190 @@
+import json
+import os
+import tempfile
+import unittest
+
+import numpy as np
+import torch
+
+from columns import ALL_VALUE_COLS, N_INTRINSIC, N_TRUE_MAG, NUM_NODES
+from columns import OBS_COLS, TRUE_MAG_COLS
+from sample_mock_galaxy import prepare_observations_from_cache, load_model
+from transformer import Simformer
+
+
+class TestSampleMockGalaxyCache(unittest.TestCase):
+    def _make_cache(self, path, values, errors, observed, columns=None):
+        np.savez(
+            path,
+            values_norm=values,
+            errors_norm=errors,
+            observed_mask=observed,
+            columns=np.array(columns if columns is not None else ALL_VALUE_COLS),
+        )
+
+    def test_prepare_observations_from_cache_condition_mask_semantics(self):
+        obs_start = N_INTRINSIC + N_TRUE_MAG
+
+        values = np.arange(3 * NUM_NODES, dtype=np.float32).reshape(3, NUM_NODES)
+        errors = np.ones((3, NUM_NODES), dtype=np.float32)
+
+        observed = np.ones((3, NUM_NODES), dtype=np.float32)
+        observed[:, obs_start:] = 0.0
+        # Configure row 2 observed-data pattern explicitly
+        observed[2, obs_start + 0] = 1.0
+        observed[2, obs_start + 1] = 0.0
+        observed[2, obs_start + 2] = 1.0
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = os.path.join(td, "cache.npz")
+            self._make_cache(cache_path, values, errors, observed)
+
+            cv, cm, om, er, selected = prepare_observations_from_cache(
+                cache_path=cache_path,
+                indices=np.array([2, 0], dtype=np.int64),
+                max_stars=1,
+                device="cpu",
+            )
+
+        self.assertEqual(tuple(cv.shape), (1, NUM_NODES))
+        self.assertEqual(tuple(cm.shape), (1, NUM_NODES, 1))
+        self.assertEqual(tuple(om.shape), (1, NUM_NODES))
+        self.assertEqual(tuple(er.shape), (1, NUM_NODES))
+        self.assertListEqual(selected.tolist(), [2])
+
+        # Sky is always conditioned
+        self.assertTrue(torch.all(cm[0, 0:3, 0] == 1.0).item())
+        # Intrinsic non-sky remains unconditioned
+        self.assertEqual(cm[0, 3, 0].item(), 0.0)
+        # Obs block condition mask mirrors observed mask
+        self.assertEqual(cm[0, obs_start + 0, 0].item(), 1.0)
+        self.assertEqual(cm[0, obs_start + 1, 0].item(), 0.0)
+        self.assertEqual(cm[0, obs_start + 2, 0].item(), 1.0)
+
+        # Row selection should preserve values/errors from selected row
+        torch.testing.assert_close(cv[0], torch.tensor(values[2]))
+        torch.testing.assert_close(er[0], torch.tensor(errors[2]))
+
+    def test_prepare_observations_from_cache_rejects_mismatched_columns(self):
+        values = np.zeros((1, NUM_NODES), dtype=np.float32)
+        errors = np.zeros((1, NUM_NODES), dtype=np.float32)
+        observed = np.ones((1, NUM_NODES), dtype=np.float32)
+
+        bad_columns = list(ALL_VALUE_COLS)
+        bad_columns[0] = "not_a_real_column"
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = os.path.join(td, "bad_columns.npz")
+            self._make_cache(cache_path, values, errors, observed, columns=bad_columns)
+
+            with self.assertRaises(ValueError):
+                prepare_observations_from_cache(cache_path=cache_path, device="cpu")
+
+    def test_prepare_observations_from_cache_rejects_out_of_bounds_indices(self):
+        values = np.zeros((2, NUM_NODES), dtype=np.float32)
+        errors = np.zeros((2, NUM_NODES), dtype=np.float32)
+        observed = np.ones((2, NUM_NODES), dtype=np.float32)
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = os.path.join(td, "cache.npz")
+            self._make_cache(cache_path, values, errors, observed)
+
+            with self.assertRaises(ValueError):
+                prepare_observations_from_cache(
+                    cache_path=cache_path,
+                    indices=np.array([10], dtype=np.int64),
+                    device="cpu",
+                )
+
+    def test_prepare_observations_from_cache_can_select_expected_column_subset(self):
+        values = np.arange(2 * NUM_NODES, dtype=np.float32).reshape(2, NUM_NODES)
+        errors = np.ones((2, NUM_NODES), dtype=np.float32)
+        observed = np.ones((2, NUM_NODES), dtype=np.float32)
+        obs_start = N_INTRINSIC + N_TRUE_MAG
+        observed[:, obs_start:] = 0.0
+        observed[:, obs_start + 0] = 1.0
+
+        expected_columns = [c for c in ALL_VALUE_COLS if c not in TRUE_MAG_COLS]
+        expected_idx = np.array([ALL_VALUE_COLS.index(c) for c in expected_columns], dtype=np.int64)
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = os.path.join(td, "cache_subset.npz")
+            self._make_cache(cache_path, values, errors, observed)
+
+            cv, cm, om, er, selected = prepare_observations_from_cache(
+                cache_path=cache_path,
+                expected_columns=expected_columns,
+                device="cpu",
+            )
+
+        self.assertEqual(tuple(cv.shape), (2, len(expected_columns)))
+        self.assertEqual(tuple(cm.shape), (2, len(expected_columns), 1))
+        self.assertEqual(tuple(om.shape), (2, len(expected_columns)))
+        self.assertEqual(tuple(er.shape), (2, len(expected_columns)))
+        self.assertListEqual(selected.tolist(), [0, 1])
+        torch.testing.assert_close(cv, torch.tensor(values[:, expected_idx]))
+        torch.testing.assert_close(er, torch.tensor(errors[:, expected_idx]))
+
+        # Sky always conditioned in reduced layout.
+        for sky in ("sky_ux", "sky_uy", "sky_uz"):
+            i = expected_columns.index(sky)
+            self.assertTrue(torch.all(cm[:, i, 0] == 1.0).item())
+
+        # Observation columns mirror observed mask in condition mask.
+        for col in OBS_COLS:
+            if col in expected_columns:
+                i = expected_columns.index(col)
+                torch.testing.assert_close(cm[:, i, 0], om[:, i])
+
+
+class TestLoadModelCheckpointCompat(unittest.TestCase):
+    def _write_norm_stats(self, path, n):
+        np.savez(
+            path,
+            means=np.zeros(n, dtype=np.float32),
+            stds=np.ones(n, dtype=np.float32),
+            columns=np.array([f"c{i}" for i in range(n)]),
+            log_err_mean=np.array(0.0, dtype=np.float32),
+            log_err_std=np.array(1.0, dtype=np.float32),
+        )
+
+    def _make_config(self):
+        return {
+            "num_nodes": 8,
+            "dim_value": 4,
+            "dim_id": 4,
+            "dim_condition": 2,
+            "dim_error": 2,
+            "dim_observed": 2,
+            "attn_embed_dim": 16,
+            "num_heads": 2,
+            "num_layers": 1,
+            "widening_factor": 2,
+            "time_embed_dim": 8,
+            "dropout": 0.0,
+        }
+
+    def test_load_model_accepts_prefixed_compiled_state_dict(self):
+        run_name = "testrun"
+        config = self._make_config()
+
+        model = Simformer(**config)
+        base_state = model.state_dict()
+        prefixed_state = {f"_orig_mod.{k}": v.clone() for k, v in base_state.items()}
+
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, f"model_config_{run_name}.json"), "w") as f:
+                json.dump(config, f)
+            torch.save(prefixed_state, os.path.join(td, f"best_model_{run_name}.pt"))
+            self._write_norm_stats(os.path.join(td, "norm_stats.npz"), config["num_nodes"])
+
+            loaded_model, stats = load_model(td, run_name=run_name, device="cpu")
+
+        self.assertEqual(stats.num_nodes, config["num_nodes"])
+        loaded_state = loaded_model.state_dict()
+        for k, v in base_state.items():
+            torch.testing.assert_close(loaded_state[k], v)
+
+
+if __name__ == "__main__":
+    unittest.main()
