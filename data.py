@@ -25,6 +25,7 @@ class CacheArrays:
     stds: np.ndarray | None
     value_transform_names: np.ndarray | None
     value_transform_params: np.ndarray | None
+    cluster_ids: np.ndarray | None
     log_err_mean: float | None
     log_err_std: float | None
 
@@ -69,6 +70,7 @@ def load_cache_arrays(cache_path: str) -> CacheArrays:
         value_transform_params=np.asarray(d["value_transform_params"], dtype=np.float32)
         if "value_transform_params" in d
         else None,
+        cluster_ids=np.asarray(d["cluster_ids"], dtype=np.int64) if "cluster_ids" in d else None,
         log_err_mean=float(d["log_err_mean"]) if "log_err_mean" in d else None,
         log_err_std=float(d["log_err_std"]) if "log_err_std" in d else None,
     )

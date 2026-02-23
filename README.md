@@ -134,6 +134,40 @@ python sbi_variants/train_sbi_posterior.py \
   --device cuda
 ```
 
+## Test holdout and cluster-aware split (NF/FM trainer)
+
+`train_sbi_posterior.py` now supports native test holdout creation:
+
+- `--test-split`: fraction of rows held out as test
+- `--test-cluster-frac`: fraction of positive cluster IDs held out as full clusters
+
+When enabled, the trainer writes:
+
+- `output_dir/test_indices.npy`
+- `output_dir/test_cluster_ids.npy` (when cluster holdout is used)
+
+The holdout rows are automatically excluded from train/val.
+
+Important precedence:
+
+- If `--exclude-indices` is provided, it overrides/ignores `--test-split` and `--test-cluster-frac`.
+
+Example (NF + zuko, cluster-aware test holdout):
+
+```bash
+python train_sbi_posterior.py \
+  --config configs/train_nf_zuko_theta.json \
+  --cache-path /path/to/build_arrays_cache.npz \
+  --output-dir /path/to/output \
+  --run-name nf_zuko_cluster_holdout \
+  --exclude-indices none \
+  --test-split 0.05 \
+  --test-cluster-frac 0.2 \
+  --wandb \
+  --wandb-project mock-galaxy-simformer \
+  --device cuda
+```
+
 ## Original Simformer with weighted joint curriculum
 
 The original Simformer/FM training path now supports the same rare-regime sampling strategy:
