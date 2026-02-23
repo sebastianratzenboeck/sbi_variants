@@ -227,6 +227,48 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-stars", type=int, default=None,
                    help="Optional cap on train+val rows after exclusions.")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--young-logage-threshold",
+        type=float,
+        default=7.8,
+        help="Physical logAge threshold used for young-star validation subset.",
+    )
+    p.add_argument(
+        "--young-eval-max-stars",
+        type=int,
+        default=0,
+        help=(
+            "Max stars for young-star validation loss each epoch (0 disables). "
+            "Subset is sampled from validation rows."
+        ),
+    )
+    p.add_argument(
+        "--random-eval-max-stars",
+        type=int,
+        default=0,
+        help=(
+            "Max stars for random unweighted validation loss each epoch (0 disables). "
+            "Subset is sampled from validation rows."
+        ),
+    )
+    p.add_argument(
+        "--val-curriculum-loss",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Also log validation loss under the same curriculum distribution as train "
+            "(standard val_loss remains natural/unweighted)."
+        ),
+    )
+    p.add_argument(
+        "--val-curriculum-epoch-size",
+        type=int,
+        default=0,
+        help=(
+            "Samples for val curriculum loss per epoch (0 => len(val)). "
+            "Only used when --val-curriculum-loss is enabled."
+        ),
+    )
 
     # Joint curriculum / importance weighting
     p.add_argument(
@@ -365,6 +407,15 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             f"--curriculum-epoch-size must be >= 0, got {args.curriculum_epoch_size}"
         )
+    if args.val_curriculum_epoch_size < 0:
+        parser.error(
+            "--val-curriculum-epoch-size must be >= 0, got "
+            f"{args.val_curriculum_epoch_size}"
+        )
+    if args.young_eval_max_stars < 0:
+        parser.error(f"--young-eval-max-stars must be >= 0, got {args.young_eval_max_stars}")
+    if args.random_eval_max_stars < 0:
+        parser.error(f"--random-eval-max-stars must be >= 0, got {args.random_eval_max_stars}")
     if not (0.0 <= args.test_split < 1.0):
         parser.error(f"--test-split must be in [0,1), got {args.test_split}")
     if not (0.0 <= args.test_cluster_frac <= 1.0):
@@ -692,6 +743,33 @@ def _epoch_loss(
     return total / max(n_batches, 1)
 
 
+def _build_eval_loader_from_rows(
+    *,
+    cache,
+    row_indices: np.ndarray,
+    input_columns: list[str],
+    theta_columns: list[str],
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+) -> DataLoader:
+    arr = build_sbi_arrays(
+        cache,
+        row_indices=row_indices,
+        input_columns=input_columns,
+        theta_columns=theta_columns,
+    )
+    ds = SBIDataset(arr)
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+
 def main() -> None:
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -814,6 +892,89 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=pin_memory,
     )
+    eval_rng = np.random.default_rng(args.seed + 2026)
+    young_val_loader = None
+    random_val_loader = None
+    val_curriculum_state = None
+    val_curriculum_ds = None
+    n_val_curr_samples_per_epoch = 0
+
+    if args.young_eval_max_stars > 0:
+        if "logAge" not in cache.columns:
+            print("WARNING: logAge not in cache columns; disabling young-star validation loss.")
+        else:
+            logage_idx = cache.columns.index("logAge")
+            if cache.means is not None and cache.stds is not None:
+                logage_val = (
+                    cache.values_norm[val_rows, logage_idx] * cache.stds[logage_idx]
+                    + cache.means[logage_idx]
+                )
+            else:
+                logage_val = cache.values_norm[val_rows, logage_idx]
+            young_rows = val_rows[logage_val < float(args.young_logage_threshold)]
+            if young_rows.size == 0:
+                print(
+                    "WARNING: no validation stars below young threshold "
+                    f"logAge<{args.young_logage_threshold}; disabling young-star validation loss."
+                )
+            else:
+                n_young = min(int(args.young_eval_max_stars), int(young_rows.size))
+                if n_young < int(young_rows.size):
+                    young_rows = eval_rng.choice(young_rows, size=n_young, replace=False).astype(np.int64)
+                young_rows = np.sort(young_rows.astype(np.int64))
+                young_val_loader = _build_eval_loader_from_rows(
+                    cache=cache,
+                    row_indices=young_rows,
+                    input_columns=input_columns,
+                    theta_columns=theta_columns,
+                    batch_size=args.batch_size,
+                    num_workers=args.num_workers,
+                    pin_memory=pin_memory,
+                )
+                print(
+                    "Young validation eval enabled: "
+                    f"logAge<{args.young_logage_threshold}, rows={len(young_rows):,}"
+                )
+
+    if args.random_eval_max_stars > 0:
+        n_rand = min(int(args.random_eval_max_stars), int(len(val_rows)))
+        if n_rand <= 0:
+            print("WARNING: no validation rows available for random unweighted eval.")
+        else:
+            rand_rows = eval_rng.choice(val_rows, size=n_rand, replace=False).astype(np.int64)
+            rand_rows = np.sort(rand_rows)
+            random_val_loader = _build_eval_loader_from_rows(
+                cache=cache,
+                row_indices=rand_rows,
+                input_columns=input_columns,
+                theta_columns=theta_columns,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                pin_memory=pin_memory,
+            )
+            print(f"Random unweighted validation eval enabled: rows={len(rand_rows):,}")
+
+    if args.val_curriculum_loss:
+        if not args.joint_curriculum:
+            print("WARNING: --val-curriculum-loss requires --joint-curriculum; disabling.")
+        else:
+            val_curriculum_state = _prepare_joint_curriculum_state(
+                theta=arr_val.theta,
+                theta_columns=theta_columns,
+                n_age_bins=args.n_bins,
+                n_mass_bins=args.n_mass_bins,
+            )
+            val_curriculum_ds = SBIDataset(arr_val)
+            n_val_curr_samples_per_epoch = (
+                int(args.val_curriculum_epoch_size)
+                if args.val_curriculum_epoch_size > 0
+                else int(len(val_curriculum_ds))
+            )
+            print(
+                "Validation curriculum eval enabled: "
+                f"epoch_samples={n_val_curr_samples_per_epoch:,}, "
+                f"active_bins={val_curriculum_state['n_active']}"
+            )
 
     model = _build_model(args, input_columns=input_columns, theta_dim=len(theta_columns))
     model.to(device)
@@ -916,6 +1077,58 @@ def main() -> None:
             train=False,
             use_amp=args.amp,
         )
+        val_loss_curriculum = None
+        if val_curriculum_state is not None and val_curriculum_ds is not None:
+            q_bin_val, w_val, _ = _joint_curriculum_distributions(
+                val_curriculum_state,
+                tau=tau,
+                importance_weighting=args.importance_weighting,
+                importance_weight_min=args.importance_weight_min,
+                importance_weight_max=args.importance_weight_max,
+            )
+            val_curriculum_ds.sample_weight = torch.from_numpy(w_val.astype(np.float32))
+            val_curr_sampler = _build_epoch_sampler(
+                state=val_curriculum_state,
+                q_bin=q_bin_val,
+                num_samples=n_val_curr_samples_per_epoch,
+                seed=int(args.seed + 1_000_000 + epoch),
+            )
+            val_curr_loader = DataLoader(
+                val_curriculum_ds,
+                batch_size=args.batch_size,
+                sampler=val_curr_sampler,
+                shuffle=False,
+                drop_last=False,
+                num_workers=args.num_workers,
+                pin_memory=pin_memory,
+            )
+            val_loss_curriculum = _epoch_loss(
+                model,
+                val_curr_loader,
+                device,
+                train=False,
+                use_amp=args.amp,
+            )
+
+        val_loss_young = None
+        if young_val_loader is not None:
+            val_loss_young = _epoch_loss(
+                model,
+                young_val_loader,
+                device,
+                train=False,
+                use_amp=args.amp,
+            )
+
+        val_loss_random_unweighted = None
+        if random_val_loader is not None:
+            val_loss_random_unweighted = _epoch_loss(
+                model,
+                random_val_loader,
+                device,
+                train=False,
+                use_amp=args.amp,
+            )
         scheduler.step()
 
         lr = optimizer.param_groups[0]["lr"]
@@ -924,6 +1137,13 @@ def main() -> None:
                 "epoch": epoch + 1,
                 "train_loss": float(train_loss),
                 "val_loss": float(val_loss),
+                "val_loss_curriculum": None
+                if val_loss_curriculum is None
+                else float(val_loss_curriculum),
+                "val_loss_young": None if val_loss_young is None else float(val_loss_young),
+                "val_loss_random_unweighted": None
+                if val_loss_random_unweighted is None
+                else float(val_loss_random_unweighted),
                 "lr": float(lr),
             }
         )
@@ -939,6 +1159,15 @@ def main() -> None:
                 f"{curriculum_log['train_importance_weight_mean']:.3f}/"
                 f"{curriculum_log['train_importance_weight_max']:.3f}"
             )
+        extra_eval_parts = []
+        if val_loss_curriculum is not None:
+            extra_eval_parts.append(f"val_curriculum={val_loss_curriculum:.6f}")
+        if val_loss_young is not None:
+            extra_eval_parts.append(f"val_young={val_loss_young:.6f}")
+        if val_loss_random_unweighted is not None:
+            extra_eval_parts.append(f"val_random_unweighted={val_loss_random_unweighted:.6f}")
+        if extra_eval_parts:
+            print("  eval: " + ", ".join(extra_eval_parts))
         if wandb_run is not None:
             payload = {
                 "epoch": epoch + 1,
@@ -946,6 +1175,12 @@ def main() -> None:
                 "val_loss": val_loss,
                 "lr": lr,
             }
+            if val_loss_curriculum is not None:
+                payload["val_loss_curriculum"] = val_loss_curriculum
+            if val_loss_young is not None:
+                payload["val_loss_young"] = val_loss_young
+            if val_loss_random_unweighted is not None:
+                payload["val_loss_random_unweighted"] = val_loss_random_unweighted
             payload.update(curriculum_log)
             wandb_run.log(payload)
 
