@@ -373,19 +373,27 @@ def load_arrays(path):
 # ---------------------------------------------------------------------------
 # Curriculum scheduling
 # ---------------------------------------------------------------------------
-def compute_age_bin_indices(log_age, n_bins):
-    """Assign each star to an age bin. Returns bin indices and bin counts."""
-    bin_edges = np.linspace(log_age.min(), log_age.max() + 1e-6, n_bins + 1)
-    bin_idx = np.digitize(log_age, bin_edges) - 1
-    bin_idx = np.clip(bin_idx, 0, n_bins - 1)
-    bin_counts = np.bincount(bin_idx, minlength=n_bins).astype(np.float64)
-    return bin_idx, bin_counts
+def compute_joint_age_mass_bin_indices(log_age, m_init, n_age_bins, n_mass_bins):
+    """Assign each star to a joint (age, mass) bin."""
+    age_edges = np.linspace(log_age.min(), log_age.max() + 1e-6, n_age_bins + 1)
+    mass_edges = np.linspace(m_init.min(), m_init.max() + 1e-6, n_mass_bins + 1)
+
+    age_idx = np.digitize(log_age, age_edges) - 1
+    age_idx = np.clip(age_idx, 0, n_age_bins - 1)
+    mass_idx = np.digitize(m_init, mass_edges) - 1
+    mass_idx = np.clip(mass_idx, 0, n_mass_bins - 1)
+
+    joint_idx = age_idx * n_mass_bins + mass_idx
+    n_joint_bins = int(n_age_bins * n_mass_bins)
+    joint_counts = np.bincount(joint_idx, minlength=n_joint_bins).astype(np.float64)
+    return joint_idx, joint_counts
 
 
 def compute_tau(epoch, total_epochs, tau_max, tau_warmup):
     """Compute temperature τ for the current epoch.
 
-    τ=0 during warmup (uniform sampling), then linearly ramps to τ_max.
+    τ=0 during warmup (uniform-over-active-joint-bins), then linearly ramps
+    to τ_max (closer to natural joint-bin frequencies).
     """
     if epoch < tau_warmup:
         return 0.0
@@ -396,83 +404,194 @@ def compute_tau(epoch, total_epochs, tau_max, tau_warmup):
     return tau_max * min(progress, 1.0)
 
 
-def build_epoch_indices(bin_idx, bin_counts, tau, cap_per_bin, rng=None):
-    """Select unique star indices for one epoch via capped per-bin sampling.
+def build_epoch_indices(
+    bin_idx,
+    bin_counts,
+    tau,
+    cap_per_bin,
+    rng=None,
+    *,
+    reference_bin_count=None,
+    importance_weighting=False,
+    importance_weight_min=0.5,
+    importance_weight_max=2.0,
+):
+    """Select unique star indices for one epoch via joint-bin mixture sampling.
 
-    At τ=0 every bin contributes min(count, cap_per_bin) stars (uniform across
-    bins).  As τ→1 larger bins contribute proportionally more, approaching
-    the natural distribution.  Each star appears at most once per epoch.
+    Let p(bin) be the natural split distribution over active bins (count > 0),
+    and K be the number of active bins.  We define
+
+      q(bin) = (1 - λ) p(bin) + λ / K
+
+    with λ = 1 - τ, so τ=0 is uniform-over-bins and τ=1 is natural.
+    Within each bin, stars are sampled uniformly without replacement.
 
     Args:
         bin_idx:      1-D array, bin assignment for every star in this split.
         bin_counts:   1-D array, number of stars per bin in this split.
-        tau:          Temperature (0 = uniform across bins, 1 = natural).
-        cap_per_bin:  Base cap at τ=0.  Larger bins may exceed this when τ>0.
+        tau:          Curriculum temperature (0 = uniform q, 1 = natural q).
+        cap_per_bin:  Per-reference-bin budget used to determine epoch size.
         rng:          numpy random Generator (for reproducibility).
+        reference_bin_count: Number of reference bins that defines epoch budget.
+            If None, uses number of active bins.
+        importance_weighting: If True, compute per-sample weights p(bin)/q(bin),
+            where p is the natural bin fraction and q is the sampled epoch fraction.
+        importance_weight_min: Lower clip bound for normalized weights.
+        importance_weight_max: Upper clip bound for normalized weights.
 
     Returns:
-        1-D numpy array of shuffled global indices (into train or val data).
+        (indices, sample_weights)
+        indices: 1-D numpy array of shuffled global indices.
+        sample_weights: Optional 1-D float32 numpy array aligned with ``indices``.
     """
     if rng is None:
         rng = np.random.default_rng()
 
-    nonzero = bin_counts[bin_counts > 0]
-    min_count = nonzero.min()
+    pop_counts = np.asarray(bin_counts, dtype=np.float64)
+    active_bins = np.where(pop_counts > 0)[0]
+    if active_bins.size == 0:
+        return np.empty(0, dtype=np.int64), None
+
+    p = np.zeros_like(pop_counts, dtype=np.float64)
+    p[active_bins] = pop_counts[active_bins] / pop_counts[active_bins].sum()
+
+    lam = float(np.clip(1.0 - tau, 0.0, 1.0))
+    q = np.zeros_like(pop_counts, dtype=np.float64)
+    q[active_bins] = (1.0 - lam) * p[active_bins] + lam * (1.0 / float(active_bins.size))
+
+    # Epoch budget: keep the old scale (~cap_per_bin * n_age_bins) even when
+    # switching to many joint bins.
+    if reference_bin_count is None:
+        ref_bins = int(active_bins.size)
+    else:
+        ref_bins = int(max(1, min(int(reference_bin_count), int(active_bins.size))))
+    epoch_size = int(np.rint(float(cap_per_bin) * float(ref_bins)))
+    epoch_size = int(max(int(active_bins.size), min(epoch_size, int(pop_counts.sum()))))
+    target_counts = np.maximum(
+        1,
+        np.rint(epoch_size * q[active_bins]).astype(np.int64),
+    )
+    max_counts = pop_counts[active_bins].astype(np.int64)
+    target_counts = np.minimum(target_counts, max_counts)
 
     selected = []
-    for b, count in enumerate(bin_counts):
-        count = int(count)
-        if count == 0:
+    selected_bins = []
+    selected_counts = np.zeros_like(bin_counts, dtype=np.int64)
+    for b, n_select in zip(active_bins.tolist(), target_counts.tolist()):
+        if n_select <= 0:
             continue
-        ratio = (count / min_count) ** tau          # 1.0 at τ=0, grows with τ
-        n_select = min(count, max(1, round(cap_per_bin * ratio)))
         members = np.where(bin_idx == b)[0]
         chosen = rng.choice(members, size=n_select, replace=False)
         selected.append(chosen)
+        selected_bins.append(np.full(n_select, b, dtype=np.int64))
+        selected_counts[b] = n_select
 
-    indices = np.concatenate(selected)
-    rng.shuffle(indices)
-    return indices
+    if not selected:
+        return np.empty(0, dtype=np.int64), None
+
+    indices = np.concatenate(selected).astype(np.int64)
+    chosen_bins = np.concatenate(selected_bins).astype(np.int64)
+    perm = rng.permutation(len(indices))
+    indices = indices[perm]
+    chosen_bins = chosen_bins[perm]
+
+    sample_weights = None
+    if importance_weighting:
+        q_emp = selected_counts.astype(np.float64)
+        q_emp = q_emp / max(q_emp.sum(), 1.0)
+        per_bin_w = np.zeros_like(p)
+        active = q_emp > 0
+        per_bin_w[active] = p[active] / q_emp[active]
+        sample_weights = per_bin_w[chosen_bins].astype(np.float32)
+
+        # Normalize to mean 1 and clip to control variance.
+        sample_weights /= max(sample_weights.mean(), 1e-8)
+        sample_weights = np.clip(
+            sample_weights,
+            float(importance_weight_min),
+            float(importance_weight_max),
+        ).astype(np.float32)
+        sample_weights /= max(sample_weights.mean(), 1e-8)
+
+    return indices, sample_weights
 
 
 def make_epoch_callback(bin_idx_train, bin_counts_train,
                         bin_idx_val, bin_counts_val,
                         tau_max, tau_warmup,
                         cap_per_bin=1000,
+                        reference_bin_count=None,
+                        use_importance_weights=False,
+                        importance_weight_min=0.5,
+                        importance_weight_max=2.0,
                         use_wandb=False):
-    """Create the epoch callback that rebuilds train/val index arrays each epoch.
-
-    Uses cap-based per-bin sampling (without replacement) instead of weighted
-    multinomial sampling.  At τ=0 every bin contributes up to cap_per_bin
-    unique stars; as τ grows, larger bins contribute proportionally more.
-    """
+    """Create the epoch callback that rebuilds train/val index arrays each epoch."""
     rng = np.random.default_rng(42)
 
     def epoch_callback(trainer, epoch, total_epochs):
         tau = compute_tau(epoch, total_epochs, tau_max, tau_warmup)
+        lam = float(np.clip(1.0 - tau, 0.0, 1.0))
 
-        train_indices = build_epoch_indices(
-            bin_idx_train, bin_counts_train, tau, cap_per_bin, rng)
-        val_indices = build_epoch_indices(
-            bin_idx_val, bin_counts_val, tau, cap_per_bin, rng)
+        train_indices, train_weights = build_epoch_indices(
+            bin_idx_train,
+            bin_counts_train,
+            tau,
+            cap_per_bin,
+            rng,
+            reference_bin_count=reference_bin_count,
+            importance_weighting=use_importance_weights,
+            importance_weight_min=importance_weight_min,
+            importance_weight_max=importance_weight_max,
+        )
+        val_indices, val_weights = build_epoch_indices(
+            bin_idx_val,
+            bin_counts_val,
+            tau,
+            cap_per_bin,
+            rng,
+            reference_bin_count=reference_bin_count,
+            importance_weighting=use_importance_weights,
+            importance_weight_min=importance_weight_min,
+            importance_weight_max=importance_weight_max,
+        )
 
-        trainer.set_epoch_indices(train_indices)
-        trainer.set_val_epoch_indices(val_indices)
+        trainer.set_epoch_indices(train_indices, sample_weights=train_weights)
+        trainer.set_val_epoch_indices(val_indices, sample_weights=val_weights)
 
         n_train_steps = len(train_indices) // trainer.batch_size
         n_val_steps = len(val_indices) // trainer.batch_size
         current_lr = trainer.optimizer.param_groups[0]['lr']
-        print(f'  [Curriculum] epoch={epoch+1}, τ={tau:.3f}, '
+        active_train_bins = int((bin_counts_train > 0).sum())
+        active_val_bins = int((bin_counts_val > 0).sum())
+        print(f'  [Curriculum] epoch={epoch+1}, τ={tau:.3f}, λ={lam:.3f}, '
+              f'active_bins(train/val)={active_train_bins}/{active_val_bins}, '
               f'train_stars={len(train_indices):,} ({n_train_steps} steps), '
               f'val_stars={len(val_indices):,} ({n_val_steps} steps), '
               f'lr={current_lr:.2e}')
+        if use_importance_weights and train_weights is not None:
+            print(
+                f'    importance weights (train): '
+                f'min={train_weights.min():.3f}, '
+                f'mean={train_weights.mean():.3f}, '
+                f'max={train_weights.max():.3f}'
+            )
 
         if use_wandb:
             import wandb
-            wandb.log({'tau': tau, 'learning_rate': current_lr,
-                       'epoch': epoch + 1,
-                       'train_stars': len(train_indices),
-                       'val_stars': len(val_indices)})
+            log = {'tau': tau, 'learning_rate': current_lr,
+                   'mixture_lambda': lam,
+                   'epoch': epoch + 1,
+                   'train_stars': len(train_indices),
+                   'val_stars': len(val_indices),
+                   'active_bins_train': active_train_bins,
+                   'active_bins_val': active_val_bins}
+            if use_importance_weights and train_weights is not None:
+                log.update({
+                    'train_importance_weight_min': float(train_weights.min()),
+                    'train_importance_weight_mean': float(train_weights.mean()),
+                    'train_importance_weight_max': float(train_weights.max()),
+                })
+            wandb.log(log)
 
     return epoch_callback
 
@@ -480,6 +599,10 @@ def make_epoch_callback(bin_idx_train, bin_counts_train,
 def make_post_epoch_callback(bin_idx_val, bin_counts_val,
                              tau_max, cap_per_bin=1000,
                              young_val_indices=None,
+                             reference_bin_count=None,
+                             use_importance_weights=False,
+                             importance_weight_min=0.5,
+                             importance_weight_max=2.0,
                              use_wandb=False):
     """Create post-epoch callback for secondary validation metrics.
 
@@ -501,9 +624,21 @@ def make_post_epoch_callback(bin_idx_val, bin_counts_val,
 
     def post_epoch_callback(trainer, epoch, total_epochs):
         # --- τ_max validation ---
-        val_indices_taumax = build_epoch_indices(
-            bin_idx_val, bin_counts_val, tau_max, cap_per_bin, rng)
-        trainer.set_val_epoch_indices(val_indices_taumax)
+        val_indices_taumax, val_weights_taumax = build_epoch_indices(
+            bin_idx_val,
+            bin_counts_val,
+            tau_max,
+            cap_per_bin,
+            rng,
+            reference_bin_count=reference_bin_count,
+            importance_weighting=use_importance_weights,
+            importance_weight_min=importance_weight_min,
+            importance_weight_max=importance_weight_max,
+        )
+        trainer.set_val_epoch_indices(
+            val_indices_taumax,
+            sample_weights=val_weights_taumax,
+        )
         val_loss_taumax = trainer.validate()
 
         if val_loss_taumax is not None:
@@ -514,7 +649,7 @@ def make_post_epoch_callback(bin_idx_val, bin_counts_val,
         if young_val_indices is not None and len(young_val_indices) >= trainer.batch_size:
             shuffled = young_val_indices.copy()
             rng.shuffle(shuffled)
-            trainer.set_val_epoch_indices(shuffled)
+            trainer.set_val_epoch_indices(shuffled, sample_weights=None)
             val_loss_young = trainer.validate()
             if val_loss_young is not None:
                 print(f'  [young val] val_loss_young = {val_loss_young:.6f}')
@@ -646,13 +781,21 @@ def _build_arg_parser():
 
     # Curriculum scheduling
     p.add_argument('--n-bins', type=int, default=25,
-                   help='Number of age bins for curriculum weighting')
+                   help='Number of logAge bins for joint (age,mass) curriculum weighting')
+    p.add_argument('--n-mass-bins', type=int, default=12,
+                   help='Number of mass bins for joint (age,mass) curriculum weighting')
     p.add_argument('--tau-max', type=float, default=0.8,
-                   help='Max temperature (0=uniform, 1=natural distribution)')
+                   help='Max τ for q=(1-λ)p+λ/K with λ=1-τ (τ=0 uniform, τ=1 natural)')
     p.add_argument('--tau-warmup', type=int, default=10,
                    help='Epochs to stay at τ=0 before ramping')
     p.add_argument('--cap-per-bin', type=int, default=100000,
-                   help='Max unique stars per age bin at τ=0 (bins with fewer stars contribute all)')
+                   help='Epoch budget scale: approx cap_per_bin * n_bins stars per epoch')
+    p.add_argument('--importance-weighting', action=argparse.BooleanOptionalAction, default=True,
+                   help='Apply per-sample importance weights p(bin)/q(bin) for curriculum-selected batches.')
+    p.add_argument('--importance-weight-min', type=float, default=0.5,
+                   help='Lower clip bound for normalized curriculum importance weights.')
+    p.add_argument('--importance-weight-max', type=float, default=2.0,
+                   help='Upper clip bound for normalized curriculum importance weights.')
 
     # Performance
     p.add_argument('--amp', action='store_true', default=False,
@@ -711,6 +854,20 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if args.n_bins <= 0:
+        raise ValueError(f'n_bins must be > 0, got {args.n_bins}')
+    if args.n_mass_bins <= 0:
+        raise ValueError(f'n_mass_bins must be > 0, got {args.n_mass_bins}')
+    if args.importance_weight_min <= 0:
+        raise ValueError(
+            f'importance_weight_min must be > 0, got {args.importance_weight_min}'
+        )
+    if args.importance_weight_max < args.importance_weight_min:
+        raise ValueError(
+            f'importance_weight_max ({args.importance_weight_max}) must be >= '
+            f'importance_weight_min ({args.importance_weight_min})'
+        )
 
     # Seed
     np.random.seed(args.seed)
@@ -867,11 +1024,19 @@ def main():
         cluster_ids = cluster_ids[trainval_indices]
     print(f'  Train+val: {len(data):,} stars')
 
-    # ---- Age bin indices for curriculum weighting ----
-    # Recover logAge from normalized data (no need for the DataFrame)
+    # ---- Joint age-mass bins for curriculum weighting ----
+    # Recover physical logAge and m_init from normalized data.
     logage_idx = active_columns.index('logAge')
+    m_init_idx = active_columns.index('m_init')
     log_age = data[:, logage_idx] * stds[logage_idx] + means[logage_idx]
-    bin_idx_all, _ = compute_age_bin_indices(log_age, args.n_bins)
+    m_init = data[:, m_init_idx] * stds[m_init_idx] + means[m_init_idx]
+    bin_idx_all, _ = compute_joint_age_mass_bin_indices(
+        log_age=log_age,
+        m_init=m_init,
+        n_age_bins=args.n_bins,
+        n_mass_bins=args.n_mass_bins,
+    )
+    n_joint_bins = int(args.n_bins * args.n_mass_bins)
 
     # Single authoritative train/val split — used for BOTH curriculum indices
     # and the trainer's data arrays (avoids double-split index misalignment).
@@ -882,9 +1047,14 @@ def main():
     )
     bin_idx_train = bin_idx_all[train_indices]
     bin_idx_val = bin_idx_all[val_indices]
-    bin_counts_train = np.bincount(bin_idx_train, minlength=args.n_bins).astype(np.float64)
-    bin_counts_val = np.bincount(bin_idx_val, minlength=args.n_bins).astype(np.float64)
-    print(f'  Curriculum: {args.n_bins} bins, train={len(train_indices):,}, val={len(val_indices):,}')
+    bin_counts_train = np.bincount(bin_idx_train, minlength=n_joint_bins).astype(np.float64)
+    bin_counts_val = np.bincount(bin_idx_val, minlength=n_joint_bins).astype(np.float64)
+    print(
+        f'  Curriculum bins: age={args.n_bins}, mass={args.n_mass_bins}, '
+        f'joint={n_joint_bins} '
+        f'(active train/val={(bin_counts_train > 0).sum()}/{(bin_counts_val > 0).sum()})'
+    )
+    print(f'  Curriculum split: train={len(train_indices):,}, val={len(val_indices):,}')
 
     # Split data arrays to match curriculum partition
     train_data = data[train_indices]
@@ -984,6 +1154,10 @@ def main():
         tau_max=args.tau_max,
         tau_warmup=args.tau_warmup,
         cap_per_bin=args.cap_per_bin,
+        reference_bin_count=args.n_bins,
+        use_importance_weights=args.importance_weighting,
+        importance_weight_min=args.importance_weight_min,
+        importance_weight_max=args.importance_weight_max,
         use_wandb=args.wandb,
     )
 
@@ -1000,6 +1174,10 @@ def main():
         tau_max=args.tau_max,
         cap_per_bin=args.cap_per_bin,
         young_val_indices=young_val_indices,
+        reference_bin_count=args.n_bins,
+        use_importance_weights=args.importance_weighting,
+        importance_weight_min=args.importance_weight_min,
+        importance_weight_max=args.importance_weight_max,
         use_wandb=args.wandb,
     )
 
@@ -1027,6 +1205,10 @@ def main():
     print(f'  Model:      {sum(p.numel() for p in best_model.parameters()):,} params')
     print(f'  Epochs:     {args.epochs}')
     print(f'  Curriculum: τ_warmup={args.tau_warmup}, τ_max={args.tau_max}')
+    print(
+        f'  Importance: enabled={args.importance_weighting}, '
+        f'clip=[{args.importance_weight_min}, {args.importance_weight_max}]'
+    )
     print(f'  LR:         {args.lr} → {args.lr_min} (cosine)')
     print(f'  AMP:        {args.amp}')
     print(f'  Compiled:   {args.compile}')

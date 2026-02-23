@@ -78,8 +78,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=42)
 
     # Joint curriculum / importance weighting
-    p.add_argument("--joint-curriculum", action="store_true", default=False,
-                   help="Enable joint (logAge,m_init) curriculum sampling q=(1-lambda)p+lambda/K.")
+    p.add_argument(
+        "--joint-curriculum",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable joint (logAge,m_init) curriculum sampling "
+            "q=(1-lambda)p+lambda/K (default: enabled)."
+        ),
+    )
     p.add_argument("--n-bins", type=int, default=25,
                    help="Number of logAge bins for joint curriculum.")
     p.add_argument("--n-mass-bins", type=int, default=12,
@@ -90,8 +97,12 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Epochs to keep tau=0 before ramping to tau-max.")
     p.add_argument("--curriculum-epoch-size", type=int, default=0,
                    help="Samples drawn per epoch when joint curriculum is enabled (0 => len(train)).")
-    p.add_argument("--importance-weighting", action="store_true", default=False,
-                   help="Apply p/q importance correction in loss for curriculum-sampled batches.")
+    p.add_argument(
+        "--importance-weighting",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply p/q importance correction in loss for curriculum-sampled batches (default: enabled).",
+    )
     p.add_argument("--importance-weight-min", type=float, default=0.5)
     p.add_argument("--importance-weight-max", type=float, default=2.0)
 

@@ -127,8 +127,10 @@ class FlowMatchingTrainer:
         self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         # Epoch indices for cap-based curriculum sampling (set via epoch callback)
         self._train_epoch_indices = None
+        self._train_epoch_weights = None
         self._train_idx_pos = 0
         self._val_epoch_indices = None
+        self._val_epoch_weights = None
         self._val_idx_pos = 0
         self.best_model_state = None
 
@@ -166,24 +168,42 @@ class FlowMatchingTrainer:
             t = t.pin_memory()
         return t
 
-    def set_epoch_indices(self, indices):
+    def set_epoch_indices(self, indices, sample_weights=None):
         """Set pre-computed training indices for this epoch.
 
         Args:
             indices: 1-D numpy array of global star indices (shuffled),
                      produced by build_epoch_indices().  Each star appears
                      at most once.  Epoch length = len(indices) // batch_size.
+            sample_weights: Optional 1-D numpy array aligned with ``indices``.
         """
         self._train_epoch_indices = torch.from_numpy(indices).long()
+        if sample_weights is not None:
+            if len(sample_weights) != len(indices):
+                raise ValueError(
+                    f"sample_weights length ({len(sample_weights)}) must match indices length ({len(indices)})"
+                )
+            self._train_epoch_weights = torch.from_numpy(sample_weights).float()
+        else:
+            self._train_epoch_weights = None
         self._train_idx_pos = 0
 
-    def set_val_epoch_indices(self, indices):
+    def set_val_epoch_indices(self, indices, sample_weights=None):
         """Set pre-computed validation indices for this epoch.
 
         Args:
             indices: 1-D numpy array of global star indices (shuffled).
+            sample_weights: Optional 1-D numpy array aligned with ``indices``.
         """
         self._val_epoch_indices = torch.from_numpy(indices).long()
+        if sample_weights is not None:
+            if len(sample_weights) != len(indices):
+                raise ValueError(
+                    f"sample_weights length ({len(sample_weights)}) must match indices length ({len(indices)})"
+                )
+            self._val_epoch_weights = torch.from_numpy(sample_weights).float()
+        else:
+            self._val_epoch_weights = None
         self._val_idx_pos = 0
 
     def sample_batch(self, from_val=False):
@@ -198,13 +218,14 @@ class FlowMatchingTrainer:
         """
         if from_val:
             data, errors, observed = self.val_data, self.val_errors, self.val_observed
-            indices, pos = self._val_epoch_indices, self._val_idx_pos
+            indices, pos, weights = self._val_epoch_indices, self._val_idx_pos, self._val_epoch_weights
         else:
             data, errors, observed = self.train_data, self.train_errors, self.train_observed
-            indices, pos = self._train_epoch_indices, self._train_idx_pos
+            indices, pos, weights = self._train_epoch_indices, self._train_idx_pos, self._train_epoch_weights
 
         if indices is not None and pos < len(indices):
             idx = indices[pos : pos + self.batch_size]
+            batch_weights = weights[pos : pos + self.batch_size] if weights is not None else None
             # Advance position counter
             if from_val:
                 self._val_idx_pos += len(idx)
@@ -213,11 +234,15 @@ class FlowMatchingTrainer:
         else:
             # Fallback: uniform random sampling (no curriculum active)
             idx = torch.randint(0, data.shape[0], (self.batch_size,))
+            batch_weights = None
 
         batch_data = data[idx].to(self.device, non_blocking=True)
         batch_errors = errors[idx].to(self.device, non_blocking=True) if errors is not None else None
         batch_observed = observed[idx].to(self.device, non_blocking=True) if observed is not None else None
-        return batch_data, batch_errors, batch_observed
+        if batch_weights is None:
+            batch_weights = torch.ones(len(idx), dtype=torch.float32)
+        batch_weights = batch_weights.to(self.device, non_blocking=True)
+        return batch_data, batch_errors, batch_observed, batch_weights
 
     def build_edge_mask(self, dense_ratio=0.7, observed_mask=None):
         N = self.num_nodes
@@ -255,7 +280,17 @@ class FlowMatchingTrainer:
         t = torch.rand(batch_size, device=self.device)
         return t.pow(1 / (1 + self.time_prior_exponent))
 
-    def flow_matching_loss(self, x0, x1, node_ids, condition_mask, edge_mask, x_errors=None, observed_mask=None):
+    def flow_matching_loss(
+        self,
+        x0,
+        x1,
+        node_ids,
+        condition_mask,
+        edge_mask,
+        x_errors=None,
+        observed_mask=None,
+        sample_weights=None,
+    ):
         """Compute standard flow matching loss."""
         B, N = x0.shape
         t = self.sample_t(B).reshape(B, 1, 1)
@@ -288,13 +323,38 @@ class FlowMatchingTrainer:
         # MSE over free dims, normalized per sample by #free dims
         diff = (v_pred - v_tgt).pow(2)  # [B,D]
         counts = free_s.sum(-1).clamp_min(1.0)  # [B]
-        loss = (diff.sum(-1) / counts).mean()  # scalar
+        per_sample = diff.sum(-1) / counts
+        if sample_weights is None:
+            loss = per_sample.mean()
+        else:
+            weights = sample_weights.to(per_sample.dtype).reshape(-1)
+            denom = weights.sum().clamp_min(1e-8)
+            loss = (per_sample * weights).sum() / denom
         return loss
 
-    def training_step(self, x0, x1, node_ids, condition_mask, edge_mask, x_errors, observed_mask=None):
+    def training_step(
+        self,
+        x0,
+        x1,
+        node_ids,
+        condition_mask,
+        edge_mask,
+        x_errors,
+        observed_mask=None,
+        sample_weights=None,
+    ):
         """Perform one training step with optional mixed-precision."""
         with _autocast_context(self.use_amp, self.device):
-            loss = self.flow_matching_loss(x0, x1, node_ids, condition_mask, edge_mask, x_errors, observed_mask=observed_mask)
+            loss = self.flow_matching_loss(
+                x0,
+                x1,
+                node_ids,
+                condition_mask,
+                edge_mask,
+                x_errors,
+                observed_mask=observed_mask,
+                sample_weights=sample_weights,
+            )
 
         self.optimizer.zero_grad()
         self.scaler.scale(loss).backward()
@@ -327,7 +387,7 @@ class FlowMatchingTrainer:
         total_val_loss = 0.0
 
         for _ in range(n_steps):
-            x1, x_errors, x_observed = self.sample_batch(from_val=True)
+            x1, x_errors, x_observed, x_weights = self.sample_batch(from_val=True)
             x0 = torch.randn_like(x1)
             condition_mask = next(self.condition_mask_generator)
             # Never condition on unobserved nodes
@@ -338,7 +398,16 @@ class FlowMatchingTrainer:
             edge_mask = self.build_edge_mask(dense_ratio=self.dense_ratio, observed_mask=x_observed)
 
             with _autocast_context(self.use_amp, self.device):
-                loss = self.flow_matching_loss(x0, x1, self.node_ids, condition_mask, edge_mask, x_errors, observed_mask=x_observed)
+                loss = self.flow_matching_loss(
+                    x0,
+                    x1,
+                    self.node_ids,
+                    condition_mask,
+                    edge_mask,
+                    x_errors,
+                    observed_mask=x_observed,
+                    sample_weights=x_weights,
+                )
             total_val_loss += loss.item()
 
         self.model.train()
@@ -381,7 +450,7 @@ class FlowMatchingTrainer:
             # Prefetch first batch so CPU→GPU transfer overlaps with compute
             next_batch = self.sample_batch(from_val=False)
             for step in range(n_steps):
-                x1, x_errors, x_observed = next_batch
+                x1, x_errors, x_observed, x_weights = next_batch
                 # Prefetch next batch while GPU processes current one
                 if step < n_steps - 1:
                     next_batch = self.sample_batch(from_val=False)
@@ -393,7 +462,16 @@ class FlowMatchingTrainer:
                     condition_mask = condition_mask * x_observed
                 edge_mask = self.build_edge_mask(dense_ratio=self.dense_ratio, observed_mask=x_observed)
 
-                step_metrics = self.training_step(x0, x1, self.node_ids, condition_mask, edge_mask, x_errors, observed_mask=x_observed)
+                step_metrics = self.training_step(
+                    x0,
+                    x1,
+                    self.node_ids,
+                    condition_mask,
+                    edge_mask,
+                    x_errors,
+                    observed_mask=x_observed,
+                    sample_weights=x_weights,
+                )
 
                 total_loss += step_metrics['loss']
                 global_step += 1
@@ -465,5 +543,3 @@ class FlowMatchingTrainer:
             self._wandb.finish()
 
         return self.model
-
-
