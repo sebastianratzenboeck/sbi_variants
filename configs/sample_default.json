@@ -1,0 +1,17 @@
+{
+  "model_dir": "/path/to/output_sbi_variants",
+  "run_name": "sbi_fm_v1",
+  "cache_path": "/path/to/build_arrays_cache.npz",
+  "index_file": "/path/to/test_indices.npy",
+  "obs_file": null,
+  "id_column": null,
+  "max_stars": 1024,
+  "sample_mode": "head",
+  "seed": 42,
+  "num_samples": 512,
+  "steps": 128,
+  "batch_size": 256,
+  "device": "cuda",
+  "output_prefix": "/path/to/output_sbi_variants/posterior_sbi_fm_v1",
+  "denormalize": true
+}

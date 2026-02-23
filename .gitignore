@@ -6,6 +6,7 @@
 
 # Track Python source files only
 !*.py
+!*.json
 
 # Keep this file
 !.gitignore
