@@ -894,6 +894,7 @@ def main() -> None:
     )
     eval_rng = np.random.default_rng(args.seed + 2026)
     young_val_loader = None
+    young_val_count = 0
     random_val_loader = None
     val_curriculum_state = None
     val_curriculum_ds = None
@@ -912,6 +913,11 @@ def main() -> None:
             else:
                 logage_val = cache.values_norm[val_rows, logage_idx]
             young_rows = val_rows[logage_val < float(args.young_logage_threshold)]
+            young_val_count = int(young_rows.size)
+            print(
+                "Young validation pool: "
+                f"logAge<{args.young_logage_threshold}, rows={young_val_count:,}"
+            )
             if young_rows.size == 0:
                 print(
                     "WARNING: no validation stars below young threshold "
@@ -935,6 +941,8 @@ def main() -> None:
                     "Young validation eval enabled: "
                     f"logAge<{args.young_logage_threshold}, rows={len(young_rows):,}"
                 )
+    else:
+        print("Young validation eval disabled (--young-eval-max-stars <= 0).")
 
     if args.random_eval_max_stars > 0:
         n_rand = min(int(args.random_eval_max_stars), int(len(val_rows)))
@@ -1011,6 +1019,7 @@ def main() -> None:
                 "theta_columns": theta_columns,
                 "train_rows": int(len(train_ds)),
                 "val_rows": int(len(val_ds)),
+                "young_val_count": int(young_val_count),
             },
         )
 
@@ -1174,11 +1183,12 @@ def main() -> None:
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "lr": lr,
+                "val_loss_young": float("nan")
+                if val_loss_young is None
+                else float(val_loss_young),
             }
             if val_loss_curriculum is not None:
                 payload["val_loss_curriculum"] = val_loss_curriculum
-            if val_loss_young is not None:
-                payload["val_loss_young"] = val_loss_young
             if val_loss_random_unweighted is not None:
                 payload["val_loss_random_unweighted"] = val_loss_random_unweighted
             payload.update(curriculum_log)
