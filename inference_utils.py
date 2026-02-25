@@ -14,8 +14,12 @@ from value_transforms import (
     apply_forward_value_transforms_torch,
     apply_inverse_value_transforms_numpy,
     apply_inverse_value_transforms_torch,
-    default_value_transform_metadata,
 )
+
+_REQUIRED_POSITIVE_TRANSFORMS = {
+    "rad": "log_shifted_pos",
+    "Av": "log1p_pos",
+}
 
 
 class NormStats:
@@ -53,31 +57,54 @@ class NormStats:
         self.stds = data["stds"].astype(np.float32)         # (num_nodes,)
         self.columns = list(data["columns"])                 # list[str]
         self.num_nodes = len(self.means)
+        self._col_to_idx = {name: i for i, name in enumerate(self.columns)}
 
         # Optional per-column value transforms.
-        # New runs save this metadata; legacy runs fall back to identity.
+        # New runs save this metadata.
         if "value_transform_names" in data and "value_transform_params" in data:
             self.value_transform_names = np.asarray(data["value_transform_names"], dtype=object)
             self.value_transform_params = np.asarray(data["value_transform_params"], dtype=np.float32)
         else:
-            self.value_transform_names, self.value_transform_params = default_value_transform_metadata(
-                [str(c) for c in self.columns]
-            )
-            # Legacy compatibility: only apply defaults if they are identity.
-            # If defaults include constrained transforms but metadata is absent,
-            # keep identity to avoid mismatched normalization on old checkpoints.
-            if any(n != "identity" for n in self.value_transform_names):
-                self.value_transform_names = np.asarray(
-                    ["identity"] * self.num_nodes, dtype=object
+            constrained_present = [
+                c for c in _REQUIRED_POSITIVE_TRANSFORMS.keys() if c in self._col_to_idx
+            ]
+            if constrained_present:
+                raise ValueError(
+                    "Normalization metadata is missing value transforms, but constrained "
+                    f"columns are present: {constrained_present}. Cannot guarantee "
+                    "non-negativity for denormalized outputs. Re-export metadata from a "
+                    "current training run (posterior_norm_meta_*.npz) or retrain/rebuild cache."
                 )
-                self.value_transform_params = np.zeros(self.num_nodes, dtype=np.float32)
+            self.value_transform_names = np.asarray(
+                ["identity"] * self.num_nodes, dtype=object
+            )
+            self.value_transform_params = np.zeros(self.num_nodes, dtype=np.float32)
+
+        if self.value_transform_names.shape[0] != self.num_nodes:
+            raise ValueError(
+                f"len(value_transform_names)={self.value_transform_names.shape[0]} "
+                f"does not match num_nodes={self.num_nodes}."
+            )
+        if self.value_transform_params.shape[0] != self.num_nodes:
+            raise ValueError(
+                f"len(value_transform_params)={self.value_transform_params.shape[0]} "
+                f"does not match num_nodes={self.num_nodes}."
+            )
+
+        for name, expected in _REQUIRED_POSITIVE_TRANSFORMS.items():
+            if name not in self._col_to_idx:
+                continue
+            idx = self._col_to_idx[name]
+            got = str(self.value_transform_names[idx])
+            if got != expected:
+                raise ValueError(
+                    f"Column '{name}' requires transform '{expected}' for positive-support "
+                    f"denormalization, but metadata has '{got}'."
+                )
 
         # Log-error normalization stats (for standardized error embedding)
         self.log_err_mean = float(data["log_err_mean"]) if "log_err_mean" in data else 0.0
         self.log_err_std = float(data["log_err_std"]) if "log_err_std" in data else 1.0
-
-        # Column name → index mapping
-        self._col_to_idx = {name: i for i, name in enumerate(self.columns)}
 
     # ------------------------------------------------------------------
     # Column lookup

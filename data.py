@@ -57,22 +57,96 @@ def load_cache_arrays(cache_path: str) -> CacheArrays:
             f"Cache {cache_path} has no `columns` metadata. Rebuild with current training pipeline."
         )
 
+    values_norm = d["values_norm"].astype(np.float32)
+    errors_norm = d["errors_norm"].astype(np.float32)
+    observed_mask = d["observed_mask"].astype(np.float32)
+    if values_norm.ndim != 2:
+        raise ValueError(
+            f"Cache {cache_path} expected values_norm to be 2-D, got shape {values_norm.shape}."
+        )
+    if errors_norm.shape != values_norm.shape:
+        raise ValueError(
+            f"Cache {cache_path} has shape mismatch: values_norm{values_norm.shape} "
+            f"vs errors_norm{errors_norm.shape}."
+        )
+    if observed_mask.shape != values_norm.shape:
+        raise ValueError(
+            f"Cache {cache_path} has shape mismatch: values_norm{values_norm.shape} "
+            f"vs observed_mask{observed_mask.shape}."
+        )
+    if values_norm.shape[1] != len(columns):
+        raise ValueError(
+            f"Cache {cache_path} column metadata mismatch: values_norm width={values_norm.shape[1]} "
+            f"but len(columns)={len(columns)}."
+        )
+
+    means = d["means"].astype(np.float32) if "means" in d else None
+    stds = d["stds"].astype(np.float32) if "stds" in d else None
+    if (means is None) != (stds is None):
+        raise ValueError(
+            f"Cache {cache_path} must contain both means and stds (or neither)."
+        )
+    if means is not None and means.shape[0] != len(columns):
+        raise ValueError(
+            f"Cache {cache_path} has len(means)={means.shape[0]} but len(columns)={len(columns)}."
+        )
+    if stds is not None and stds.shape[0] != len(columns):
+        raise ValueError(
+            f"Cache {cache_path} has len(stds)={stds.shape[0]} but len(columns)={len(columns)}."
+        )
+
+    has_transform_names = "value_transform_names" in d
+    has_transform_params = "value_transform_params" in d
+    if has_transform_names != has_transform_params:
+        raise ValueError(
+            f"Cache {cache_path} must contain both value_transform_names and "
+            "value_transform_params (or neither)."
+        )
+    value_transform_names = (
+        np.asarray(d["value_transform_names"], dtype=object) if has_transform_names else None
+    )
+    value_transform_params = (
+        np.asarray(d["value_transform_params"], dtype=np.float32) if has_transform_params else None
+    )
+    if value_transform_names is not None and value_transform_names.shape[0] != len(columns):
+        raise ValueError(
+            f"Cache {cache_path} has len(value_transform_names)={value_transform_names.shape[0]} "
+            f"but len(columns)={len(columns)}."
+        )
+    if value_transform_params is not None and value_transform_params.shape[0] != len(columns):
+        raise ValueError(
+            f"Cache {cache_path} has len(value_transform_params)={value_transform_params.shape[0]} "
+            f"but len(columns)={len(columns)}."
+        )
+
+    cluster_ids = np.asarray(d["cluster_ids"], dtype=np.int64) if "cluster_ids" in d else None
+    if cluster_ids is not None and cluster_ids.shape[0] != values_norm.shape[0]:
+        raise ValueError(
+            f"Cache {cache_path} has len(cluster_ids)={cluster_ids.shape[0]} but "
+            f"n_rows={values_norm.shape[0]}."
+        )
+
+    has_log_err_mean = "log_err_mean" in d
+    has_log_err_std = "log_err_std" in d
+    if has_log_err_mean != has_log_err_std:
+        raise ValueError(
+            f"Cache {cache_path} must contain both log_err_mean and log_err_std (or neither)."
+        )
+    log_err_mean = float(d["log_err_mean"]) if has_log_err_mean else None
+    log_err_std = float(d["log_err_std"]) if has_log_err_std else None
+
     return CacheArrays(
-        values_norm=d["values_norm"].astype(np.float32),
-        errors_norm=d["errors_norm"].astype(np.float32),
-        observed_mask=d["observed_mask"].astype(np.float32),
+        values_norm=values_norm,
+        errors_norm=errors_norm,
+        observed_mask=observed_mask,
         columns=columns,
-        means=d["means"].astype(np.float32) if "means" in d else None,
-        stds=d["stds"].astype(np.float32) if "stds" in d else None,
-        value_transform_names=np.asarray(d["value_transform_names"], dtype=object)
-        if "value_transform_names" in d
-        else None,
-        value_transform_params=np.asarray(d["value_transform_params"], dtype=np.float32)
-        if "value_transform_params" in d
-        else None,
-        cluster_ids=np.asarray(d["cluster_ids"], dtype=np.int64) if "cluster_ids" in d else None,
-        log_err_mean=float(d["log_err_mean"]) if "log_err_mean" in d else None,
-        log_err_std=float(d["log_err_std"]) if "log_err_std" in d else None,
+        means=means,
+        stds=stds,
+        value_transform_names=value_transform_names,
+        value_transform_params=value_transform_params,
+        cluster_ids=cluster_ids,
+        log_err_mean=log_err_mean,
+        log_err_std=log_err_std,
     )
 
 

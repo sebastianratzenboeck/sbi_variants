@@ -25,6 +25,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(repo_root))
 
 from sbi_variants.data import (
+    CacheArrays,
     DEFAULT_INPUT_COLS,
     DEFAULT_THETA_COLS,
     SBIDataset,
@@ -39,6 +40,7 @@ from sbi_variants.posterior_models import (
     ConditionalFMPosterior,
     ConditionalFlowPosterior,
 )
+from sbi_variants.value_transforms import apply_inverse_value_transforms_numpy
 from train_mock_galaxy import (
     DEFAULT_CLUSTER_ID_COL,
     build_arrays as build_cache_arrays,
@@ -47,6 +49,10 @@ from train_mock_galaxy import (
 )
 
 _BIN_SAMPLER_CHUNK_SIZE = 1_000_000
+_REQUIRED_POSITIVE_TRANSFORMS = {
+    "rad": "log_shifted_pos",
+    "Av": "log1p_pos",
+}
 
 
 class _JointBinFirstSampler(Sampler[int]):
@@ -540,6 +546,16 @@ def _prepare_joint_curriculum_state(
 
     age = theta[:, age_idx]
     mass = theta[:, mass_idx]
+    if not np.all(np.isfinite(age)):
+        n_bad = int((~np.isfinite(age)).sum())
+        raise ValueError(
+            f"Joint curriculum input has {n_bad} non-finite logAge values."
+        )
+    if not np.all(np.isfinite(mass)):
+        n_bad = int((~np.isfinite(mass)).sum())
+        raise ValueError(
+            f"Joint curriculum input has {n_bad} non-finite m_init values."
+        )
     age_edges = np.linspace(age.min(), age.max() + 1e-6, n_age_bins + 1)
     mass_edges = np.linspace(mass.min(), mass.max() + 1e-6, n_mass_bins + 1)
 
@@ -574,6 +590,104 @@ def _prepare_joint_curriculum_state(
         "bin_offsets": bin_offsets,
         "n_active": int(active.sum()),
     }
+
+
+def _cache_column_physical_values(
+    cache: CacheArrays, row_indices: np.ndarray, column_name: str,
+) -> np.ndarray:
+    """Recover one cache column in physical units for the requested rows."""
+    if column_name not in cache.columns:
+        raise ValueError(
+            f"Column '{column_name}' not found in cache columns."
+        )
+    if cache.means is None or cache.stds is None:
+        raise ValueError(
+            "Cache is missing means/stds metadata required to recover physical "
+            f"'{column_name}' values. Rebuild cache with current pipeline."
+        )
+    col_idx = cache.columns.index(column_name)
+    std = float(cache.stds[col_idx])
+    mean = float(cache.means[col_idx])
+    if (not np.isfinite(std)) or (std <= 0.0):
+        raise ValueError(
+            f"Invalid std for column '{column_name}': std={std}. "
+            "Expected finite positive std in cache metadata."
+        )
+
+    rows = np.asarray(row_indices, dtype=np.int64)
+    vals = cache.values_norm[rows, col_idx].astype(np.float64, copy=False)
+    vals = vals * std + mean
+
+    if cache.value_transform_names is not None and cache.value_transform_params is not None:
+        vals = apply_inverse_value_transforms_numpy(
+            vals.reshape(-1, 1),
+            transform_names=np.asarray([cache.value_transform_names[col_idx]], dtype=object),
+            transform_params=np.asarray([cache.value_transform_params[col_idx]], dtype=np.float32),
+        ).reshape(-1)
+    return vals.astype(np.float32, copy=False)
+
+
+def _validate_curriculum_space_assumptions(
+    cache: CacheArrays, theta_columns: list[str],
+) -> None:
+    """Validate assumptions behind binning directly on normalized theta arrays."""
+    if cache.means is None or cache.stds is None:
+        raise ValueError(
+            "Joint curriculum requires cache means/stds metadata for robust "
+            "physical-space diagnostics. Rebuild cache with current pipeline."
+        )
+
+    if cache.value_transform_names is None:
+        return
+
+    for name in ("logAge", "m_init"):
+        if name not in theta_columns:
+            continue
+        if name not in cache.columns:
+            raise ValueError(
+                f"Joint curriculum requested '{name}', but cache columns are missing it."
+            )
+        idx = cache.columns.index(name)
+        transform_name = str(cache.value_transform_names[idx])
+        if transform_name != "identity":
+            raise ValueError(
+                "Joint curriculum currently bins on standardized theta values, "
+                f"which matches physical equal-width bins only for affine scaling. "
+                f"Found non-identity transform '{transform_name}' for '{name}'."
+            )
+
+
+def _validate_positive_support_transforms(
+    cache: CacheArrays, theta_columns: list[str],
+) -> None:
+    """Require constrained-parameter transforms for modeled positive thetas."""
+    constrained = [c for c in theta_columns if c in _REQUIRED_POSITIVE_TRANSFORMS]
+    if not constrained:
+        return
+
+    if cache.value_transform_names is None or cache.value_transform_params is None:
+        raise ValueError(
+            "Theta includes constrained positive parameters "
+            f"{constrained}, but cache transform metadata is missing. "
+            "Cannot guarantee non-negativity support for posterior samples. "
+            "Rebuild cache with current preprocessing (--rebuild-cache --data-path ...)."
+        )
+
+    for name in constrained:
+        if name not in cache.columns:
+            raise ValueError(
+                f"Theta includes '{name}', but cache columns are missing it."
+            )
+        idx = cache.columns.index(name)
+        expected = _REQUIRED_POSITIVE_TRANSFORMS[name]
+        got = str(cache.value_transform_names[idx])
+        if got != expected:
+            raise ValueError(
+                f"Theta includes constrained parameter '{name}', expected transform "
+                f"'{expected}', but cache metadata has '{got}'. "
+                "This would break guaranteed non-negativity after denormalization. "
+                "Rebuild cache with current preprocessing."
+            )
 
 
 def _compute_test_split_with_cluster_holdout(
@@ -883,6 +997,7 @@ def main() -> None:
         raise ValueError("input_columns resolved to empty list.")
     if len(theta_columns) == 0:
         raise ValueError("theta_columns resolved to empty list.")
+    _validate_positive_support_transforms(cache, theta_columns)
 
     generated_test_idx_path = None
     generated_test_cluster_ids_path = None
@@ -946,6 +1061,7 @@ def main() -> None:
     val_ds = SBIDataset(arr_val)
     pin_memory = (device != "cpu" and torch.cuda.is_available())
     if args.joint_curriculum:
+        _validate_curriculum_space_assumptions(cache, theta_columns)
         curriculum_state = _prepare_joint_curriculum_state(
             theta=arr_train.theta,
             theta_columns=theta_columns,
@@ -997,14 +1113,9 @@ def main() -> None:
         if "logAge" not in cache.columns:
             print("WARNING: logAge not in cache columns; disabling young-star validation loss.")
         else:
-            logage_idx = cache.columns.index("logAge")
-            if cache.means is not None and cache.stds is not None:
-                logage_val = (
-                    cache.values_norm[val_rows, logage_idx] * cache.stds[logage_idx]
-                    + cache.means[logage_idx]
-                )
-            else:
-                logage_val = cache.values_norm[val_rows, logage_idx]
+            logage_val = _cache_column_physical_values(
+                cache, row_indices=val_rows, column_name="logAge",
+            )
             young_rows = val_rows[logage_val < float(args.young_logage_threshold)]
             young_val_count = int(young_rows.size)
             print(
