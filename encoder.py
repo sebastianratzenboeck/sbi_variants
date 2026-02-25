@@ -117,7 +117,12 @@ class ObservationEncoder(nn.Module):
                 "Check input column layout."
             )
 
-        x = values.unsqueeze(-1)
+        # Safety: map stray NaN → 0 (= standardised mean) before embedding.
+        # The cache builder already fills NaN with 0, but a corrupted cache or
+        # a normalisation edge-case could still slip through.  The error path
+        # has its own nan_to_num (sentinel=5.0) inside ErrorEmbed; this is the
+        # matching guard for the value path.
+        x = torch.nan_to_num(values, nan=0.0).unsqueeze(-1)
         e = errors.unsqueeze(-1)
         node_ids = torch.arange(N, device=values.device).unsqueeze(0).expand(B, -1)
         cond_mask = torch.zeros(B, N, 1, device=values.device, dtype=values.dtype)

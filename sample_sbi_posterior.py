@@ -200,7 +200,9 @@ def _prepare_from_cache(
         sample_mode=sample_mode,
         seed=seed,
     )
-    values = cache.values_norm[rows][:, in_idx].astype(np.float32)
+    values = np.nan_to_num(
+        cache.values_norm[rows][:, in_idx], nan=0.0,
+    ).astype(np.float32)
     errors = cache.errors_norm[rows][:, in_idx].astype(np.float32)
     observed = cache.observed_mask[rows][:, in_idx].astype(np.float32)
     star_ids = rows

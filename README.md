@@ -82,9 +82,11 @@ python sbi_variants/train_sbi_posterior.py \
   --lr 8e-4 \
   --lr-min 1e-5 \
   --use-missingness-context \
-  --amp \
+  --train-random-eval-max-stars 50000 \
   --device cuda
 ```
+
+NF autocast note: for numerical stability of `log_prob`/log-det, the trainer disables AMP on the NF loss path even if `--amp` is passed. FM training still uses AMP when enabled.
 
 One-line NF-theta launcher (uses `configs/train_nf_zuko_theta.json` by default):
 
@@ -109,10 +111,14 @@ Compatibility note: `--method realnvp` is kept as an alias for `normalizing_flow
 
 ## Joint curriculum + importance correction
 
-For rare-regime retention (e.g., young/high-mass) while keeping the natural-population target objective:
+For rare-regime retention (e.g., young/high-mass) while keeping control over optimisation stability:
 
 - Joint `(logAge, m_init)` curriculum sampling is enabled by default.
-- `p/q` importance correction in NF/FM loss is enabled by default.
+- Importance correction is enabled by default with tempered exponent `w=(p/q)^beta`.
+- Recommended NF defaults use:
+  - `importance_weight_beta=0.5`
+  - wide safety-only clamps (`importance_weight_min=1e-3`, `importance_weight_max=1e3`)
+  - `nll_cap=500` (smooth cap on NF backprop path)
 - Disable explicitly with:
   - `--no-joint-curriculum`
   - `--no-importance-weighting`
@@ -133,15 +139,35 @@ python sbi_variants/train_sbi_posterior.py \
   --tau-warmup 20 \
   --tau-max 0.8 \
   --curriculum-epoch-size 0 \
-  --importance-weight-min 0.5 \
-  --importance-weight-max 2.0 \
+  --importance-weight-beta 0.5 \
+  --importance-weight-min 1e-3 \
+  --importance-weight-max 1e3 \
+  --nll-cap 500 \
+  --train-random-eval-max-stars 50000 \
   --batch-size 4096 \
   --epochs 300 \
   --lr 8e-4 \
   --lr-min 1e-5 \
-  --amp \
   --device cuda
 ```
+
+`train_weight_clip_frac` is logged to console/wandb; it should stay near 0. Persistently high values mean clamp bounds are actively distorting the objective.
+
+
+## Metric semantics (NF/FM trainer)
+
+The trainer now logs multiple loss views with distinct meanings:
+
+- `train_nll_q`: unweighted mean NLL/MSE on training batches actually drawn that epoch (under curriculum distribution `q`).
+- `train_nll_p_random`: optional natural-distribution train metric from a fixed random train subset (`--train-random-eval-max-stars`).
+- `train_loss_optim`: optimisation objective used for backprop (importance-weighted, with optional smooth NF cap).
+- `val_loss`: natural unweighted validation mean (primary model-selection metric).
+- `val_loss_curriculum`: optional curriculum-sampled validation objective view.
+
+Comparability guidance:
+
+- Compare `train_nll_p_random` vs `val_loss` for like-for-like natural-distribution generalisation.
+- Do not directly compare `train_nll_q` to `val_loss` when curriculum sampling is enabled.
 
 ## Test holdout and cluster-aware split (NF/FM trainer)
 
@@ -228,6 +254,7 @@ Training writes:
 - `posterior_norm_meta_<run_name>.npz`
 
 The metadata file keeps normalization/column information for later denormalization and sampling scripts.
+The history file includes `train_nll_q`, `train_nll_p_random` (if enabled), `train_loss_optim`, and validation diagnostics.
 
 ## Sampling example
 

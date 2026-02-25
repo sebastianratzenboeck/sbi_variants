@@ -1,10 +1,42 @@
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from transformer import TimeEmbed
+
+
+class LossResult(NamedTuple):
+    """Container returned by ``model.loss()``.
+
+    Attributes:
+        loss:  Scalar for ``.backward()`` (weighted, optionally smooth-capped).
+        nll_sum:  Sum of raw per-sample NLL/MSE values (detached, uncapped,
+                  unweighted, **fp32**).  Divide by *n_samples* for the plain mean.
+        n_samples:  Number of samples in the batch.
+        w_sum:  Sum of IS weights for the batch.  Equals *n_samples* when no
+                importance weights are used.  Needed to combine per-batch SNIS
+                estimates into a correct global ratio.
+    """
+    loss: torch.Tensor
+    nll_sum: torch.Tensor
+    n_samples: int
+    w_sum: float
+
+
+def _softplus_upper_cap(
+    x: torch.Tensor, cap: float, sharpness: float = 5.0,
+) -> torch.Tensor:
+    """Smooth upper cap: identity for *x* ≪ *cap*, approaches *cap* for *x* ≫ *cap*.
+
+    Uses ``cap − softplus(k·(cap − x)) / k`` where *k* = *sharpness*.
+    The gradient transitions continuously from 1 (well below cap) to 0
+    (well above cap), with ``f'(cap) = 0.5``.
+    """
+    return cap - F.softplus(sharpness * (cap - x)) / sharpness
 
 
 def _mlp(in_dim: int, hidden_dim: int, out_dim: int, depth: int = 3, dropout: float = 0.0) -> nn.Sequential:
@@ -66,7 +98,8 @@ class ConditionalFMPosterior(nn.Module):
         errors: torch.Tensor,       # (B, N)
         observed_mask: torch.Tensor,  # (B, N)
         sample_weights: torch.Tensor | None = None,  # (B,)
-    ) -> torch.Tensor:
+        nll_cap: float = 0.0,
+    ) -> LossResult:
         B = theta.shape[0]
         ctx = self.encoder(values, errors, observed_mask)
 
@@ -79,11 +112,14 @@ class ConditionalFMPosterior(nn.Module):
         v_tgt = theta - k * x0
         v_pred = self.predict_velocity(theta_t, t, ctx)
         per_sample = (v_pred - v_tgt).pow(2).mean(dim=1)
+
+        nll_sum = per_sample.detach().float().sum()
+
         if sample_weights is None:
-            return per_sample.mean()
+            return LossResult(loss=per_sample.mean(), nll_sum=nll_sum, n_samples=B, w_sum=float(B))
         w = sample_weights.to(per_sample.dtype).reshape(-1)
         denom = w.sum().clamp_min(1e-8)
-        return (per_sample * w).sum() / denom
+        return LossResult(loss=(per_sample * w).sum() / denom, nll_sum=nll_sum, n_samples=B, w_sum=float(denom))
 
     @torch.no_grad()
     def sample(
@@ -258,13 +294,30 @@ class ConditionalFlowPosterior(nn.Module):
         errors: torch.Tensor,
         observed_mask: torch.Tensor,
         sample_weights: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        nll_cap: float = 0.0,
+    ) -> LossResult:
         nll = self.nll(theta, values, errors, observed_mask)
+        n_samples = nll.shape[0]
+        # Force fp32 accumulation — under AMP autocast nll can be fp16,
+        # and summing thousands of NLL values in fp16 easily overflows.
+        nll_sum = nll.detach().float().sum()
+
+        # Smooth upper cap for backprop path (NF NLL can have extreme outliers).
+        nll_for_loss = _softplus_upper_cap(nll, nll_cap) if nll_cap > 0 else nll
+
         if sample_weights is None:
-            return nll.mean()
-        w = sample_weights.to(nll.dtype).reshape(-1)
+            return LossResult(
+                loss=nll_for_loss.mean(), nll_sum=nll_sum,
+                n_samples=n_samples, w_sum=float(n_samples),
+            )
+        w = sample_weights.to(nll_for_loss.dtype).reshape(-1)
         denom = w.sum().clamp_min(1e-8)
-        return (nll * w).sum() / denom
+        return LossResult(
+            loss=(nll_for_loss * w).sum() / denom,
+            nll_sum=nll_sum,
+            n_samples=n_samples,
+            w_sum=float(denom),
+        )
 
     @torch.no_grad()
     def sample(

@@ -252,6 +252,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--train-random-eval-max-stars",
+        type=int,
+        default=0,
+        help=(
+            "Max stars for random unweighted train loss each epoch (0 disables). "
+            "Subset is sampled from training rows under the natural distribution."
+        ),
+    )
+    p.add_argument(
         "--val-curriculum-loss",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -296,8 +305,23 @@ def _build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Apply p/q importance correction in loss for curriculum-sampled batches (default: enabled).",
     )
-    p.add_argument("--importance-weight-min", type=float, default=0.5)
-    p.add_argument("--importance-weight-max", type=float, default=2.0)
+    p.add_argument("--importance-weight-beta", type=float, default=1.0,
+                   help=(
+                       "Tempered IS exponent: w=(p/q)^beta. "
+                       "1.0=full IS correction (natural-distribution gradient), "
+                       "0.0=no correction (pure curriculum effect). "
+                       "Values in (0,1) give a compromise."
+                   ))
+    p.add_argument("--importance-weight-min", type=float, default=0.5,
+                   help="Safety lower clamp for importance weights (after beta tempering).")
+    p.add_argument("--importance-weight-max", type=float, default=2.0,
+                   help="Safety upper clamp for importance weights (after beta tempering).")
+    p.add_argument("--nll-cap", type=float, default=0.0,
+                   help=(
+                       "Smooth upper cap (softplus-based) applied to per-sample NLL "
+                       "during training for gradient stability.  0 disables the cap. "
+                       "Recommended ~500 for normalizing-flow training with curriculum."
+                   ))
 
     # Encoder
     p.add_argument("--dim-value", type=int, default=24)
@@ -416,6 +440,10 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"--young-eval-max-stars must be >= 0, got {args.young_eval_max_stars}")
     if args.random_eval_max_stars < 0:
         parser.error(f"--random-eval-max-stars must be >= 0, got {args.random_eval_max_stars}")
+    if args.train_random_eval_max_stars < 0:
+        parser.error(
+            f"--train-random-eval-max-stars must be >= 0, got {args.train_random_eval_max_stars}"
+        )
     if not (0.0 <= args.test_split < 1.0):
         parser.error(f"--test-split must be in [0,1), got {args.test_split}")
     if not (0.0 <= args.test_cluster_frac <= 1.0):
@@ -429,6 +457,12 @@ def parse_args() -> argparse.Namespace:
             "--importance-weight-max must be >= --importance-weight-min "
             f"({args.importance_weight_max} < {args.importance_weight_min})"
         )
+    if not (0.0 <= args.importance_weight_beta <= 1.0):
+        parser.error(
+            f"--importance-weight-beta must be in [0,1], got {args.importance_weight_beta}"
+        )
+    if args.nll_cap < 0:
+        parser.error(f"--nll-cap must be >= 0, got {args.nll_cap}")
     return args
 
 
@@ -625,9 +659,21 @@ def _joint_curriculum_distributions(
     tau: float,
     *,
     importance_weighting: bool,
+    importance_weight_beta: float,
     importance_weight_min: float,
     importance_weight_max: float,
-) -> tuple[np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Compute curriculum sampling distribution and importance weights.
+
+    Returns:
+        q_bin: Sampling distribution over joint bins.
+        w_i: Per-sample importance weights (tempered, clipped, re-normalised).
+        lam: Mixture parameter (1 = fully uniform bins, 0 = natural bins).
+        clip_frac: Fraction of samples whose weights were clipped by the
+            safety bounds.  Should stay near 0 if beta and bounds are well
+            chosen; persistently high values indicate the bounds are actively
+            changing the optimisation objective.
+    """
     joint = state["joint"]
     p_bin = state["p_bin"]
     active = state["active"]
@@ -638,14 +684,31 @@ def _joint_curriculum_distributions(
     q_bin[active] = (1.0 - lam) * p_bin[active] + lam * (1.0 / float(n_active))
 
     if importance_weighting:
-        w_i = (p_bin[joint] / q_bin[joint]).astype(np.float32)
-        w_i /= max(float(w_i.mean()), 1e-8)
-        w_i = np.clip(w_i, float(importance_weight_min), float(importance_weight_max)).astype(np.float32)
+        raw = (p_bin[joint] / q_bin[joint]).astype(np.float64)
+        # Tempered IS: w = (p/q)^beta.
+        #   beta=1 → full IS correction (equivalent to natural-distribution gradient).
+        #   beta=0 → no correction (pure curriculum effect on gradient).
+        #   0<beta<1 → partial correction (compromise).
+        if importance_weight_beta != 1.0:
+            raw = np.power(raw, float(importance_weight_beta))
+        w_i = (raw / max(float(raw.mean()), 1e-8)).astype(np.float32)
+        # Compute clip fraction *before* clipping for diagnostics.
+        n_total = len(w_i)
+        n_clipped = int(
+            np.sum(w_i < float(importance_weight_min))
+            + np.sum(w_i > float(importance_weight_max))
+        )
+        clip_frac = n_clipped / max(n_total, 1)
+        # Safety clamp (wide bounds; should rarely trigger with tempered beta).
+        w_i = np.clip(
+            w_i, float(importance_weight_min), float(importance_weight_max),
+        ).astype(np.float32)
         w_i /= max(float(w_i.mean()), 1e-8)
     else:
         w_i = np.ones_like(joint, dtype=np.float32)
+        clip_frac = 0.0
 
-    return q_bin.astype(np.float64), w_i, lam
+    return q_bin.astype(np.float64), w_i, lam, clip_frac
 
 
 def _build_model(args: argparse.Namespace, input_columns: list[str], theta_dim: int) -> torch.nn.Module:
@@ -703,27 +766,45 @@ def _epoch_loss(
     scaler: GradScaler | None = None,
     use_amp: bool = False,
     grad_clip_norm: float = 1.0,
-) -> float:
+    nll_cap: float = 0.0,
+) -> dict[str, float]:
+    """Run one epoch and return sample-count-weighted loss statistics.
+
+    Returns a dict with keys:
+        ``"weighted"`` – global optimisation objective assembled as an exact
+            ratio of summed weighted numerators/denominators across batches
+            (importance-weighted, optionally smooth-capped during training).
+        ``"nll_mean"`` – true sample-mean of raw per-sample NLL/MSE values
+            (unweighted, uncapped).  Comparable across different sampling
+            distributions.
+        ``"n_samples"`` – total number of samples processed.
+    """
     if train:
         model.train()
     else:
         model.eval()
 
-    total = 0.0
-    n_batches = 0
+    total_weighted_num = 0.0   # accumulates sum(w * nll_capped) across batches
+    total_weighted_den = 0.0   # accumulates sum(w) across batches
+    total_nll = 0.0
+    total_samples = 0
+    # Only apply the smooth NLL cap during training (backprop stabilisation);
+    # evaluation always uses raw NLL so that monitored metrics are unbiased.
+    effective_cap = nll_cap if train else 0.0
     for batch in loader:
         batch = _move_batch(batch, device=device)
         if train:
             optimizer.zero_grad(set_to_none=True)
             with _autocast_context(use_amp, device):
-                loss = model.loss(
+                result = model.loss(
                     theta=batch["theta"],
                     values=batch["inputs"],
                     errors=batch["errors"],
                     observed_mask=batch["observed"],
                     sample_weights=batch.get("sample_weight"),
+                    nll_cap=effective_cap,
                 )
-            scaler.scale(loss).backward()
+            scaler.scale(result.loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             scaler.step(optimizer)
@@ -731,16 +812,27 @@ def _epoch_loss(
         else:
             with torch.no_grad():
                 with _autocast_context(use_amp, device):
-                    loss = model.loss(
+                    result = model.loss(
                         theta=batch["theta"],
                         values=batch["inputs"],
                         errors=batch["errors"],
                         observed_mask=batch["observed"],
                         sample_weights=batch.get("sample_weight"),
+                        nll_cap=effective_cap,
                     )
-        total += float(loss.item())
-        n_batches += 1
-    return total / max(n_batches, 1)
+        # Combine per-batch SNIS numerators/denominators for exact global ratio.
+        # loss = sum(w*nll_cap)/sum(w), so loss*w_sum = sum(w*nll_cap).
+        total_weighted_num += float(result.loss.item()) * result.w_sum
+        total_weighted_den += result.w_sum
+        total_nll += float(result.nll_sum.item())
+        total_samples += result.n_samples
+
+    n = max(total_samples, 1)
+    return {
+        "weighted": total_weighted_num / max(total_weighted_den, 1e-8),
+        "nll_mean": total_nll / n,
+        "n_samples": total_samples,
+    }
 
 
 def _build_eval_loader_from_rows(
@@ -896,6 +988,7 @@ def main() -> None:
     young_val_loader = None
     young_val_count = 0
     random_val_loader = None
+    train_random_loader = None
     val_curriculum_state = None
     val_curriculum_ds = None
     n_val_curr_samples_per_epoch = 0
@@ -962,6 +1055,24 @@ def main() -> None:
             )
             print(f"Random unweighted validation eval enabled: rows={len(rand_rows):,}")
 
+    if args.train_random_eval_max_stars > 0:
+        n_train_rand = min(int(args.train_random_eval_max_stars), int(len(train_rows)))
+        if n_train_rand <= 0:
+            print("WARNING: no training rows available for random unweighted train eval.")
+        else:
+            train_rand_rows = eval_rng.choice(train_rows, size=n_train_rand, replace=False).astype(np.int64)
+            train_rand_rows = np.sort(train_rand_rows)
+            train_random_loader = _build_eval_loader_from_rows(
+                cache=cache,
+                row_indices=train_rand_rows,
+                input_columns=input_columns,
+                theta_columns=theta_columns,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                pin_memory=pin_memory,
+            )
+            print(f"Random unweighted train eval enabled: rows={len(train_rand_rows):,}")
+
     if args.val_curriculum_loss:
         if not args.joint_curriculum:
             print("WARNING: --val-curriculum-loss requires --joint-curriculum; disabling.")
@@ -986,7 +1097,14 @@ def main() -> None:
 
     model = _build_model(args, input_columns=input_columns, theta_dim=len(theta_columns))
     model.to(device)
-    if args.compile:
+    # Zuko/nflows flows cause many graph breaks under torch.compile (lazy
+    # Distribution objects, functools.partial, generator expressions) making
+    # compilation pointless — results are correct but every graph fragment
+    # falls back to eager.  Only compile for flow-matching.
+    use_compile = bool(args.compile and args.method == "flow_matching")
+    if args.compile and not use_compile:
+        print("torch.compile requested, but disabled for NF backend (graph breaks in Zuko/nflows).")
+    if use_compile:
         model = torch.compile(model)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -1000,10 +1118,16 @@ def main() -> None:
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr_min)
+
+    # NF log_prob/log-det is numerically fragile under autocast; keep AMP for FM only.
+    use_amp_loss = bool(args.amp and args.method == "flow_matching" and device != "cpu")
+    if args.amp and args.method in ("normalizing_flow", "realnvp"):
+        print("AMP requested, but disabled for NF loss path for numerical stability.")
+
     try:
-        scaler = GradScaler("cuda", enabled=(args.amp and device != "cpu"))
+        scaler = GradScaler("cuda", enabled=use_amp_loss)
     except TypeError:
-        scaler = GradScaler(enabled=(args.amp and device != "cpu"))
+        scaler = GradScaler(enabled=use_amp_loss)
 
     wandb_run = None
     if args.wandb:
@@ -1036,10 +1160,11 @@ def main() -> None:
         curriculum_log = {}
         if args.joint_curriculum:
             tau = _compute_tau(epoch, args.epochs, args.tau_max, args.tau_warmup)
-            q_bin, w_i, lam = _joint_curriculum_distributions(
+            q_bin, w_i, lam, clip_frac = _joint_curriculum_distributions(
                 curriculum_state,
                 tau=tau,
                 importance_weighting=args.importance_weighting,
+                importance_weight_beta=args.importance_weight_beta,
                 importance_weight_min=args.importance_weight_min,
                 importance_weight_max=args.importance_weight_max,
             )
@@ -1062,36 +1187,60 @@ def main() -> None:
             curriculum_log = {
                 "tau": float(tau),
                 "mixture_lambda": float(lam),
+                "importance_weight_beta": float(args.importance_weight_beta),
                 "train_importance_weight_min": float(w_i.min()),
                 "train_importance_weight_mean": float(w_i.mean()),
                 "train_importance_weight_max": float(w_i.max()),
+                "train_weight_clip_frac": float(clip_frac),
             }
         else:
             epoch_train_loader = train_loader
 
-        train_loss = _epoch_loss(
+        train_result = _epoch_loss(
             model,
             epoch_train_loader,
             device,
             train=True,
             optimizer=optimizer,
             scaler=scaler,
-            use_amp=args.amp,
+            use_amp=use_amp_loss,
             grad_clip_norm=args.grad_clip_norm,
+            nll_cap=args.nll_cap,
         )
-        val_loss = _epoch_loss(
+        # nll_mean = unweighted sample mean of raw NLL over the training batch.
+        # Under curriculum sampling this is E_q[NLL], NOT E_p[NLL], so it is
+        # NOT directly comparable to val_loss (which is E_p[NLL]).  Use it to
+        # monitor training progress, but not for model selection.
+        train_nll_q = train_result["nll_mean"]
+        train_loss_optim = train_result["weighted"]  # the actual backprop objective
+
+        train_nll_p_random = None
+        if train_random_loader is not None:
+            train_rand_result = _epoch_loss(
+                model,
+                train_random_loader,
+                device,
+                train=False,
+                use_amp=use_amp_loss,
+            )
+            train_nll_p_random = train_rand_result["nll_mean"]
+
+        val_result = _epoch_loss(
             model,
             val_loader,
             device,
             train=False,
-            use_amp=args.amp,
+            use_amp=use_amp_loss,
         )
+        val_loss = val_result["nll_mean"]
+
         val_loss_curriculum = None
         if val_curriculum_state is not None and val_curriculum_ds is not None:
-            q_bin_val, w_val, _ = _joint_curriculum_distributions(
+            q_bin_val, w_val, _, _ = _joint_curriculum_distributions(
                 val_curriculum_state,
                 tau=tau,
                 importance_weighting=args.importance_weighting,
+                importance_weight_beta=args.importance_weight_beta,
                 importance_weight_min=args.importance_weight_min,
                 importance_weight_max=args.importance_weight_max,
             )
@@ -1111,40 +1260,47 @@ def main() -> None:
                 num_workers=args.num_workers,
                 pin_memory=pin_memory,
             )
-            val_loss_curriculum = _epoch_loss(
+            val_curr_result = _epoch_loss(
                 model,
                 val_curr_loader,
                 device,
                 train=False,
-                use_amp=args.amp,
+                use_amp=use_amp_loss,
             )
+            val_loss_curriculum = val_curr_result["weighted"]
 
         val_loss_young = None
         if young_val_loader is not None:
-            val_loss_young = _epoch_loss(
+            val_young_result = _epoch_loss(
                 model,
                 young_val_loader,
                 device,
                 train=False,
-                use_amp=args.amp,
+                use_amp=use_amp_loss,
             )
+            val_loss_young = val_young_result["nll_mean"]
 
         val_loss_random_unweighted = None
         if random_val_loader is not None:
-            val_loss_random_unweighted = _epoch_loss(
+            val_rand_result = _epoch_loss(
                 model,
                 random_val_loader,
                 device,
                 train=False,
-                use_amp=args.amp,
+                use_amp=use_amp_loss,
             )
+            val_loss_random_unweighted = val_rand_result["nll_mean"]
         scheduler.step()
 
         lr = optimizer.param_groups[0]["lr"]
         hist.append(
             {
                 "epoch": epoch + 1,
-                "train_loss": float(train_loss),
+                "train_nll_q": float(train_nll_q),
+                "train_nll_p_random": None
+                if train_nll_p_random is None
+                else float(train_nll_p_random),
+                "train_loss_optim": float(train_loss_optim),
                 "val_loss": float(val_loss),
                 "val_loss_curriculum": None
                 if val_loss_curriculum is None
@@ -1156,17 +1312,23 @@ def main() -> None:
                 "lr": float(lr),
             }
         )
+        train_rand_msg = (
+            "" if train_nll_p_random is None else f" train_nll_p_random={train_nll_p_random:.6f}"
+        )
         print(
             f"Epoch {epoch + 1:04d}/{args.epochs} "
-            f"train_loss={train_loss:.6f} val_loss={val_loss:.6f} lr={lr:.2e}"
+            f"train_nll(q)={train_nll_q:.6f}{train_rand_msg} val_loss={val_loss:.6f} "
+            f"train_optim={train_loss_optim:.6f} lr={lr:.2e}"
         )
         if args.joint_curriculum:
             print(
                 f"  curriculum: tau={curriculum_log['tau']:.3f}, "
                 f"lambda={curriculum_log['mixture_lambda']:.3f}, "
+                f"beta={curriculum_log['importance_weight_beta']:.2f}, "
                 f"w[min/mean/max]={curriculum_log['train_importance_weight_min']:.3f}/"
                 f"{curriculum_log['train_importance_weight_mean']:.3f}/"
-                f"{curriculum_log['train_importance_weight_max']:.3f}"
+                f"{curriculum_log['train_importance_weight_max']:.3f}, "
+                f"clip_frac={curriculum_log['train_weight_clip_frac']:.4f}"
             )
         extra_eval_parts = []
         if val_loss_curriculum is not None:
@@ -1180,7 +1342,11 @@ def main() -> None:
         if wandb_run is not None:
             payload = {
                 "epoch": epoch + 1,
-                "train_loss": train_loss,
+                "train_nll_q": train_nll_q,
+                "train_nll_p_random": float("nan")
+                if train_nll_p_random is None
+                else float(train_nll_p_random),
+                "train_loss_optim": train_loss_optim,
                 "val_loss": val_loss,
                 "lr": lr,
                 "val_loss_young": float("nan")
