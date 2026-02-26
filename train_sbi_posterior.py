@@ -346,6 +346,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--use-missingness-context", action="store_true", default=False)
     p.add_argument("--missingness-context-hidden-dim", type=int, default=64)
 
+    # Color features
+    p.add_argument(
+        "--use-colors",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Append color features (e.g., BP-RP, J-Ks, cross-survey colors) to inputs."
+    )
+
     # Flow-matching head
     p.add_argument("--time-prior-exponent", type=float, default=0.0)
     p.add_argument("--sigma-min", type=float, default=1e-3)
@@ -958,12 +966,16 @@ def _build_eval_loader_from_rows(
     batch_size: int,
     num_workers: int,
     pin_memory: bool,
+    use_colors: bool = False,
+    color_norm_stats: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> DataLoader:
     arr = build_sbi_arrays(
         cache,
         row_indices=row_indices,
         input_columns=input_columns,
         theta_columns=theta_columns,
+        use_colors=use_colors,
+        color_norm_stats=color_norm_stats,
     )
     ds = SBIDataset(arr)
     return DataLoader(
@@ -1049,13 +1061,25 @@ def main() -> None:
         row_indices=train_rows,
         input_columns=input_columns,
         theta_columns=theta_columns,
+        use_colors=args.use_colors,
     )
+    # For validation, use the color normalization stats from training
+    color_norm_stats = None
+    if args.use_colors and arr_train.color_means is not None:
+        color_norm_stats = (arr_train.color_means, arr_train.color_stds)
     arr_val = build_sbi_arrays(
         cache,
         row_indices=val_rows,
         input_columns=input_columns,
         theta_columns=theta_columns,
+        use_colors=args.use_colors,
+        color_norm_stats=color_norm_stats,
     )
+    # Extend input_columns with color names for model construction
+    if args.use_colors and arr_train.color_names is not None:
+        extended_input_columns = list(input_columns) + arr_train.color_names
+    else:
+        extended_input_columns = list(input_columns)
 
     train_ds = SBIDataset(arr_train)
     val_ds = SBIDataset(arr_val)
@@ -1140,6 +1164,8 @@ def main() -> None:
                     batch_size=args.batch_size,
                     num_workers=args.num_workers,
                     pin_memory=pin_memory,
+                    use_colors=args.use_colors,
+                    color_norm_stats=color_norm_stats,
                 )
                 print(
                     "Young validation eval enabled: "
@@ -1163,6 +1189,8 @@ def main() -> None:
                 batch_size=args.batch_size,
                 num_workers=args.num_workers,
                 pin_memory=pin_memory,
+                use_colors=args.use_colors,
+                color_norm_stats=color_norm_stats,
             )
             print(f"Random unweighted validation eval enabled: rows={len(rand_rows):,}")
 
@@ -1181,6 +1209,8 @@ def main() -> None:
                 batch_size=args.batch_size,
                 num_workers=args.num_workers,
                 pin_memory=pin_memory,
+                use_colors=args.use_colors,
+                color_norm_stats=color_norm_stats,
             )
             print(f"Random unweighted train eval enabled: rows={len(train_rand_rows):,}")
 
@@ -1206,7 +1236,7 @@ def main() -> None:
                 f"active_bins={val_curriculum_state['n_active']}"
             )
 
-    model = _build_model(args, input_columns=input_columns, theta_dim=len(theta_columns))
+    model = _build_model(args, input_columns=extended_input_columns, theta_dim=len(theta_columns))
     model.to(device)
     # Zuko/nflows flows cause many graph breaks under torch.compile (lazy
     # Distribution objects, functools.partial, generator expressions) making
@@ -1220,9 +1250,11 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model params: {n_params:,}")
+    n_colors = len(arr_train.color_names) if arr_train.color_names else 0
     print(
         f"Dataset rows: train={len(train_ds):,}, val={len(val_ds):,}; "
-        f"input_nodes={len(input_columns)}, theta_dim={len(theta_columns)}"
+        f"input_nodes={len(extended_input_columns)} (base={len(input_columns)}, colors={n_colors}), "
+        f"theta_dim={len(theta_columns)}"
     )
     if generated_test_idx_path is not None:
         print(f"Generated test split saved at: {generated_test_idx_path}")
@@ -1490,7 +1522,9 @@ def main() -> None:
     config_out = {
         **vars(args),
         "input_columns": input_columns,
+        "input_columns_with_colors": extended_input_columns,
         "theta_columns": theta_columns,
+        "color_names": arr_train.color_names if arr_train.color_names else [],
         "resolved_exclude_indices": args.exclude_indices if args.exclude_indices is not None else generated_test_idx_path,
         "generated_test_indices_path": generated_test_idx_path,
         "generated_test_cluster_ids_path": generated_test_cluster_ids_path,
@@ -1512,8 +1546,7 @@ def main() -> None:
 
     # Save cache normalization metadata for downstream denormalization/inference.
     meta_path = os.path.join(args.output_dir, f"posterior_norm_meta_{args.run_name}.npz")
-    np.savez(
-        meta_path,
+    meta_dict = dict(
         columns=np.asarray(cache.columns, dtype=object),
         means=cache.means if cache.means is not None else np.zeros(len(cache.columns), dtype=np.float32),
         stds=cache.stds if cache.stds is not None else np.ones(len(cache.columns), dtype=np.float32),
@@ -1531,9 +1564,17 @@ def main() -> None:
             cache.log_err_std if cache.log_err_std is not None else 1.0,
             dtype=np.float32,
         ),
-        input_columns=np.asarray(input_columns, dtype=object),
+        input_columns=np.asarray(extended_input_columns, dtype=object),
+        input_columns_base=np.asarray(input_columns, dtype=object),
         theta_columns=np.asarray(theta_columns, dtype=object),
+        use_colors=np.array(args.use_colors, dtype=bool),
     )
+    # Add color normalization stats if colors are used
+    if args.use_colors and arr_train.color_names is not None:
+        meta_dict["color_names"] = np.asarray(arr_train.color_names, dtype=object)
+        meta_dict["color_means"] = arr_train.color_means
+        meta_dict["color_stds"] = arr_train.color_stds
+    np.savez(meta_path, **meta_dict)
     print(f"Saved normalization metadata: {meta_path}")
 
     if wandb_run is not None:

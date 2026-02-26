@@ -1,6 +1,7 @@
 {
   "cache_path": null,
   "data_path": null,
+  "rebuild_cache": true,
   "output_dir": "/path/to/output_sbi_variants",
   "run_name": "sbi_nf_zuko_theta",
   "method": "normalizing_flow",
@@ -41,6 +42,7 @@
   "dropout": 0.05,
   "use_missingness_context": true,
   "missingness_context_hidden_dim": 64,
+  "use_colors": true,
   "nf_hidden_dim": 256,
   "nf_backend": "zuko",
   "nf_family": "nsf",

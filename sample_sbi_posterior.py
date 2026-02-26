@@ -18,10 +18,10 @@ if __package__ in (None, ""):
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-from columns import OBS_COLS, OBS_ERR_COLS
+from columns import COLOR_DEFINITIONS, OBS_COLS, OBS_ERR_COLS
 from inference_utils import NormStats
 from prepare_data import galactic_to_unitvec
-from sbi_variants.data import column_indices, load_cache_arrays
+from sbi_variants.data import column_indices, compute_colors_from_cache, load_cache_arrays
 from sbi_variants.encoder import ObservationEncoder
 from sbi_variants.posterior_models import (
     ConditionalFMPosterior,
@@ -113,8 +113,16 @@ def _load_state_dict(path: str, device: str) -> dict:
     return state
 
 
-def _build_model_from_config(config: dict) -> torch.nn.Module:
-    input_columns = [str(c) for c in config["input_columns"]]
+def _build_model_from_config(
+    config: dict,
+    *,
+    input_columns_override: Sequence[str] | None = None,
+) -> torch.nn.Module:
+    input_columns = (
+        [str(c) for c in input_columns_override]
+        if input_columns_override is not None
+        else [str(c) for c in config["input_columns"]]
+    )
     theta_columns = [str(c) for c in config["theta_columns"]]
     encoder = ObservationEncoder(
         input_columns=input_columns,
@@ -156,6 +164,84 @@ def _build_model_from_config(config: dict) -> torch.nn.Module:
     raise ValueError(f"Unsupported method '{method}' in posterior config.")
 
 
+def _resolve_color_definitions(
+    color_names: Sequence[str],
+) -> list[tuple[str, str, str]]:
+    by_name = {name: (name, m1, m2) for (name, m1, m2) in COLOR_DEFINITIONS}
+    missing = [str(n) for n in color_names if str(n) not in by_name]
+    if missing:
+        raise ValueError(
+            "Unknown color definitions requested by checkpoint metadata: "
+            f"{missing[:5]}" + ("..." if len(missing) > 5 else "")
+        )
+    return [by_name[str(n)] for n in color_names]
+
+
+def _resolve_input_layout(
+    config: dict,
+    norm_stats: NormStats,
+) -> tuple[list[str], list[str], bool, list[str], np.ndarray | None, np.ndarray | None]:
+    base_source = config.get(
+        "input_columns_base",
+        norm_stats.input_columns_base if norm_stats.input_columns_base is not None else config["input_columns"],
+    )
+    base_cols = [str(c) for c in base_source]
+    use_colors = bool(config.get("use_colors", False) or norm_stats.use_colors)
+    model_source = config.get(
+        "input_columns_with_colors",
+        norm_stats.input_columns_meta if norm_stats.input_columns_meta is not None else config["input_columns"],
+    )
+    model_cols = [str(c) for c in model_source]
+    if not use_colors:
+        return base_cols, base_cols, False, [], None, None
+
+    if len(model_cols) <= len(base_cols):
+        # Older configs may not carry input_columns_with_colors; infer from metadata.
+        if norm_stats.input_columns_meta is not None and len(norm_stats.input_columns_meta) > len(base_cols):
+            model_cols = list(norm_stats.input_columns_meta)
+        else:
+            color_tail = [str(c) for c in config.get("color_names", [])]
+            model_cols = base_cols + color_tail
+
+    color_names = list(norm_stats.color_names) if norm_stats.color_names else [str(c) for c in config.get("color_names", [])]
+    if not color_names:
+        # Last fallback: derive from model column tail.
+        color_names = model_cols[len(base_cols):]
+    if not color_names:
+        raise ValueError(
+            "Checkpoint indicates use_colors=true but no color_names are available in config/metadata."
+        )
+    if norm_stats.color_means is None or norm_stats.color_stds is None:
+        raise ValueError(
+            "Checkpoint indicates use_colors=true but color normalization stats are missing "
+            "from posterior_norm_meta_*.npz."
+        )
+
+    if norm_stats.color_names:
+        idx = {n: i for i, n in enumerate(norm_stats.color_names)}
+        missing = [n for n in color_names if n not in idx]
+        if missing:
+            raise ValueError(
+                "Color names requested by config are missing from normalization metadata: "
+                f"{missing[:5]}" + ("..." if len(missing) > 5 else "")
+            )
+        color_means = np.asarray([norm_stats.color_means[idx[n]] for n in color_names], dtype=np.float32)
+        color_stds = np.asarray([norm_stats.color_stds[idx[n]] for n in color_names], dtype=np.float32)
+    else:
+        color_means = np.asarray(norm_stats.color_means, dtype=np.float32)
+        color_stds = np.asarray(norm_stats.color_stds, dtype=np.float32)
+        if color_means.shape[0] != len(color_names) or color_stds.shape[0] != len(color_names):
+            raise ValueError(
+                "Color normalization stats length does not match resolved color_names."
+            )
+
+    expected_model_cols = base_cols + list(color_names)
+    if model_cols != expected_model_cols:
+        model_cols = expected_model_cols
+
+    return base_cols, model_cols, True, list(color_names), color_means, color_stds
+
+
 def _select_rows(
     n_rows: int,
     *,
@@ -190,6 +276,10 @@ def _prepare_from_cache(
     max_stars: int | None,
     sample_mode: str,
     seed: int,
+    use_colors: bool = False,
+    color_definitions: Sequence[tuple[str, str, str]] | None = None,
+    color_means: np.ndarray | None = None,
+    color_stds: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     cache = load_cache_arrays(cache_path)
     in_idx = column_indices(cache.columns, input_columns, role="input")
@@ -205,6 +295,34 @@ def _prepare_from_cache(
     ).astype(np.float32)
     errors = cache.errors_norm[rows][:, in_idx].astype(np.float32)
     observed = cache.observed_mask[rows][:, in_idx].astype(np.float32)
+
+    if use_colors:
+        if color_definitions is None:
+            raise ValueError("use_colors=True requires color_definitions.")
+        if color_means is None or color_stds is None:
+            raise ValueError("use_colors=True requires color_means/color_stds.")
+        (
+            colors_norm_train,
+            color_err_norm,
+            color_obs,
+            _color_names,
+            color_means_train,
+            color_stds_train,
+        ) = compute_colors_from_cache(
+            cache=cache,
+            row_indices=rows,
+            color_definitions=list(color_definitions),
+        )
+        # Re-normalize with saved training-set stats to match model inputs.
+        colors_raw = colors_norm_train * color_stds_train + color_means_train
+        denom = np.where(color_stds > 1e-8, color_stds, 1.0)
+        colors_norm = (colors_raw - color_means) / denom
+        colors_norm[~np.isfinite(colors_norm)] = 0.0
+
+        values = np.concatenate([values, colors_norm.astype(np.float32)], axis=1)
+        errors = np.concatenate([errors, color_err_norm.astype(np.float32)], axis=1)
+        observed = np.concatenate([observed, color_obs.astype(np.float32)], axis=1)
+
     star_ids = rows
     return values, errors, observed, star_ids
 
@@ -234,6 +352,10 @@ def _prepare_from_obs_file(
     max_stars: int | None,
     sample_mode: str,
     seed: int,
+    use_colors: bool = False,
+    color_definitions: Sequence[tuple[str, str, str]] | None = None,
+    color_means: np.ndarray | None = None,
+    color_stds: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if obs_file.endswith(".parquet"):
         obs_df = pd.read_parquet(obs_file)
@@ -309,6 +431,51 @@ def _prepare_from_obs_file(
     values_norm = np.nan_to_num(values_norm, nan=0.0)
     errors_norm = norm_stats.normalize_errors(errors_raw).astype(np.float32)
 
+    if use_colors:
+        if color_definitions is None:
+            raise ValueError("use_colors=True requires color_definitions.")
+        if color_means is None or color_stds is None:
+            raise ValueError("use_colors=True requires color_means/color_stds.")
+        if len(color_definitions) != int(color_means.shape[0]) or len(color_definitions) != int(color_stds.shape[0]):
+            raise ValueError(
+                "Color metadata mismatch: color_definitions and color stats lengths differ."
+            )
+
+        n_colors = len(color_definitions)
+        color_vals_norm = np.zeros((n, n_colors), dtype=np.float32)
+        color_err_norm = np.full((n, n_colors), 5.0, dtype=np.float32)  # unobserved sentinel
+        color_obs = np.zeros((n, n_colors), dtype=np.float32)
+
+        for i, (_name, c1, c2) in enumerate(color_definitions):
+            if c1 not in col_to_local or c2 not in col_to_local:
+                raise ValueError(
+                    f"Color definition uses source column not in model input columns: ({c1}, {c2})."
+                )
+            j1 = col_to_local[c1]
+            j2 = col_to_local[c2]
+
+            obs_pair = (observed[:, j1] > 0.5) & (observed[:, j2] > 0.5)
+            raw_color = values_raw[:, j1] - values_raw[:, j2]
+            denom = float(color_stds[i]) if float(color_stds[i]) > 1e-8 else 1.0
+            c_norm = (raw_color - float(color_means[i])) / denom
+            c_norm[~np.isfinite(c_norm)] = 0.0
+            c_norm[~obs_pair] = 0.0
+            color_vals_norm[:, i] = c_norm.astype(np.float32)
+            color_obs[:, i] = obs_pair.astype(np.float32)
+
+            err1 = errors_raw[:, j1]
+            err2 = errors_raw[:, j2]
+            raw_err = np.sqrt(err1**2 + err2**2)
+            valid_err = obs_pair & np.isfinite(raw_err) & (raw_err > 0.0)
+            if np.any(valid_err):
+                color_err_norm[valid_err, i] = (
+                    np.log(np.clip(raw_err[valid_err], 1e-10, None)) - norm_stats.log_err_mean
+                ) / max(float(norm_stats.log_err_std), 1e-8)
+
+        values_norm = np.concatenate([values_norm, color_vals_norm], axis=1)
+        errors_norm = np.concatenate([errors_norm, color_err_norm.astype(np.float32)], axis=1)
+        observed = np.concatenate([observed, color_obs.astype(np.float32)], axis=1)
+
     if id_column is not None and id_column in obs_df.columns:
         star_ids = obs_df[id_column].to_numpy()
     else:
@@ -368,20 +535,32 @@ def main() -> None:
                 f"No normalization metadata found at {meta_path} or {fallback_meta}"
             )
 
+    norm_stats = NormStats(meta_path)
     config = _load_json(cfg_path)
     method = str(config.get("method", "flow_matching"))
-    input_columns = [str(c) for c in config["input_columns"]]
     theta_columns = [str(c) for c in config["theta_columns"]]
+    (
+        input_columns_base,
+        input_columns_model,
+        use_colors,
+        color_names,
+        color_means,
+        color_stds,
+    ) = _resolve_input_layout(config, norm_stats)
+    color_definitions = _resolve_color_definitions(color_names) if use_colors else []
 
-    model = _build_model_from_config(config)
+    model = _build_model_from_config(config, input_columns_override=input_columns_model)
     state_dict = _load_state_dict(ckpt_path, device=device)
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Loaded model: method={method}, params={n_params:,}")
-
-    norm_stats = NormStats(meta_path)
+    if use_colors:
+        print(
+            f"Color inputs enabled: base={len(input_columns_base)}, "
+            f"colors={len(color_names)}, total={len(input_columns_model)}"
+        )
     theta_idx_full = [norm_stats.column_index(c) for c in theta_columns]
 
     if args.cache_path is not None:
@@ -393,22 +572,30 @@ def main() -> None:
                 print(f"Using default index file: {index_file}")
         values_np, errors_np, observed_np, star_ids = _prepare_from_cache(
             args.cache_path,
-            input_columns=input_columns,
+            input_columns=input_columns_base,
             index_file=index_file,
             max_stars=args.max_stars,
             sample_mode=args.sample_mode,
             seed=args.seed,
+            use_colors=use_colors,
+            color_definitions=color_definitions,
+            color_means=color_means,
+            color_stds=color_stds,
         )
         source_name = args.cache_path
     else:
         values_np, errors_np, observed_np, star_ids = _prepare_from_obs_file(
             args.obs_file,
-            input_columns=input_columns,
+            input_columns=input_columns_base,
             norm_stats=norm_stats,
             id_column=args.id_column,
             max_stars=args.max_stars,
             sample_mode=args.sample_mode,
             seed=args.seed,
+            use_colors=use_colors,
+            color_definitions=color_definitions,
+            color_means=color_means,
+            color_stds=color_stds,
         )
         source_name = args.obs_file
 
@@ -508,7 +695,10 @@ def main() -> None:
         "num_stars": int(n_stars),
         "num_samples": int(args.num_samples),
         "theta_columns": theta_columns,
-        "input_columns": input_columns,
+        "input_columns": input_columns_model,
+        "input_columns_base": input_columns_base,
+        "use_colors": use_colors,
+        "color_names": color_names if use_colors else [],
         "denormalize": bool(args.denormalize),
         "steps": int(args.steps) if method == "flow_matching" else None,
         "batch_size": int(args.batch_size),

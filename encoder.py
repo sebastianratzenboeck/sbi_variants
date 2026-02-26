@@ -85,6 +85,7 @@ class ObservationEncoder(nn.Module):
             self.missingness_context_encoder = MissingnessContextEncoder(
                 out_dim=attn_embed_dim,
                 obs_start_idx=self.obs_start_idx,
+                obs_indices=obs_local_idx,
                 survey_obs_groups=survey_groups,
                 hidden_dim=missingness_context_hidden_dim,
             )

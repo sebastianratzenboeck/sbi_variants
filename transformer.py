@@ -174,11 +174,13 @@ class MissingnessContextEncoder(nn.Module):
         self,
         out_dim,
         obs_start_idx,
+        obs_indices=None,
         survey_obs_groups=None,
         hidden_dim=64,
     ):
         super().__init__()
         self.obs_start_idx = int(obs_start_idx)
+        self.obs_indices = [int(i) for i in (obs_indices or [])]
         self.survey_obs_groups = [list(g) for g in (survey_obs_groups or [])]
         self.log_err_perfect = -4.9
         self.log_err_unobs = 4.9
@@ -206,7 +208,11 @@ class MissingnessContextEncoder(nn.Module):
             obs = observed_mask.squeeze(-1) if observed_mask.dim() == 3 else observed_mask
             obs = (obs > 0.5).to(device=dev, dtype=dt)
 
-        obs_block = obs[:, self.obs_start_idx:] if self.obs_start_idx < N else obs[:, 0:0]
+        if self.obs_indices:
+            idx = torch.tensor(self.obs_indices, dtype=torch.long, device=dev)
+            obs_block = obs.index_select(1, idx)
+        else:
+            obs_block = obs[:, self.obs_start_idx:] if self.obs_start_idx < N else obs[:, 0:0]
         if obs_block.shape[1] > 0:
             frac_obs_total = obs_block.mean(dim=1, keepdim=True)
         else:
@@ -229,7 +235,11 @@ class MissingnessContextEncoder(nn.Module):
         else:
             e = errors.squeeze(-1) if errors.dim() == 3 else errors
             e = e.to(device=dev, dtype=dt)
-            e_block = e[:, self.obs_start_idx:] if self.obs_start_idx < N else e[:, 0:0]
+            if self.obs_indices:
+                idx = torch.tensor(self.obs_indices, dtype=torch.long, device=dev)
+                e_block = e.index_select(1, idx)
+            else:
+                e_block = e[:, self.obs_start_idx:] if self.obs_start_idx < N else e[:, 0:0]
             if e_block.shape[1] == 0:
                 mean_real = torch.zeros(B, 1, device=dev, dtype=dt)
                 std_real = torch.zeros(B, 1, device=dev, dtype=dt)
@@ -433,6 +443,7 @@ class Simformer(nn.Module):
                  use_observed_embedding=True,  # Whether to use observed mask
                  use_missingness_context=False,  # add one global missingness token
                  obs_start_idx=0,  # start index of observation block
+                 obs_indices=None,  # optional explicit observed-node indices
                  survey_obs_groups=None,  # list[list[int]] absolute node indices
                  missingness_context_hidden_dim=64,
                  # Attention embedding dimension
@@ -464,6 +475,7 @@ class Simformer(nn.Module):
             self.missingness_context_encoder = MissingnessContextEncoder(
                 out_dim=attn_embed_dim,
                 obs_start_idx=obs_start_idx,
+                obs_indices=obs_indices,
                 survey_obs_groups=survey_obs_groups,
                 hidden_dim=missingness_context_hidden_dim,
             )

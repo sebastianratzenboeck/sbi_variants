@@ -106,6 +106,47 @@ class NormStats:
         self.log_err_mean = float(data["log_err_mean"]) if "log_err_mean" in data else 0.0
         self.log_err_std = float(data["log_err_std"]) if "log_err_std" in data else 1.0
 
+        # Optional input-column metadata for extended feature sets (e.g. colors).
+        self.input_columns_base = (
+            [str(c) for c in data["input_columns_base"].tolist()]
+            if "input_columns_base" in data
+            else None
+        )
+        self.input_columns_meta = (
+            [str(c) for c in data["input_columns"].tolist()]
+            if "input_columns" in data
+            else None
+        )
+
+        self.use_colors = bool(np.asarray(data["use_colors"]).item()) if "use_colors" in data else False
+        if "color_names" in data:
+            self.color_names = [str(c) for c in data["color_names"].tolist()]
+        else:
+            self.color_names = []
+        self.color_means = (
+            np.asarray(data["color_means"], dtype=np.float32)
+            if "color_means" in data
+            else None
+        )
+        self.color_stds = (
+            np.asarray(data["color_stds"], dtype=np.float32)
+            if "color_stds" in data
+            else None
+        )
+        if self.use_colors:
+            if not self.color_names or self.color_means is None or self.color_stds is None:
+                raise ValueError(
+                    "Normalization metadata indicates use_colors=true but color statistics "
+                    "(color_names/color_means/color_stds) are missing."
+                )
+            if len(self.color_names) != self.color_means.shape[0] or len(self.color_names) != self.color_stds.shape[0]:
+                raise ValueError(
+                    "Color metadata shape mismatch: "
+                    f"len(color_names)={len(self.color_names)}, "
+                    f"len(color_means)={self.color_means.shape[0]}, "
+                    f"len(color_stds)={self.color_stds.shape[0]}."
+                )
+
     # ------------------------------------------------------------------
     # Column lookup
     # ------------------------------------------------------------------

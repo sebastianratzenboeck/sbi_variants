@@ -1,5 +1,7 @@
 {
   "cache_path": "/path/to/build_arrays_cache.npz",
+  "data_path": null,
+  "rebuild_cache": true,
   "output_dir": "/path/to/output_sbi_variants",
   "run_name": "sbi_fm_baseline",
   "method": "flow_matching",
@@ -35,6 +37,7 @@
   "dropout": 0.05,
   "use_missingness_context": true,
   "missingness_context_hidden_dim": 64,
+  "use_colors": true,
   "time_prior_exponent": 0.0,
   "sigma_min": 0.001,
   "time_embed_dim": 64,
