@@ -187,6 +187,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", type=str, default=None,
                    help="Output directory for checkpoints/configs.")
     p.add_argument("--run-name", type=str, default="sbi_variant")
+    p.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a training resume checkpoint created by this trainer "
+            "(contains model/optimizer/scheduler/scaler state). If a plain model "
+            "state_dict is provided, only model weights are restored."
+        ),
+    )
     p.add_argument("--method", type=str, default="flow_matching",
                    choices=["flow_matching", "normalizing_flow", "realnvp"])
 
@@ -878,6 +888,123 @@ def _move_batch(batch: dict[str, torch.Tensor], device: str) -> dict[str, torch.
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
+def _align_state_dict_prefix_for_model(
+    model: torch.nn.Module,
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Align `_orig_mod.` prefixes between checkpoint keys and target model keys."""
+    if not state_dict:
+        return state_dict
+    model_keys = list(model.state_dict().keys())
+    if not model_keys:
+        return state_dict
+    ckpt_prefixed = all(str(k).startswith("_orig_mod.") for k in state_dict.keys())
+    model_prefixed = all(str(k).startswith("_orig_mod.") for k in model_keys)
+    if ckpt_prefixed and not model_prefixed:
+        return {str(k)[len("_orig_mod."):]: v for k, v in state_dict.items()}
+    if model_prefixed and not ckpt_prefixed:
+        return {f"_orig_mod.{k}": v for k, v in state_dict.items()}
+    return state_dict
+
+
+def _save_resume_checkpoint(
+    path: str,
+    *,
+    model: torch.nn.Module,
+    optimizer: AdamW,
+    scheduler: CosineAnnealingLR,
+    scaler: GradScaler,
+    epoch: int,
+    best_val: float,
+    best_epoch: int,
+    no_improve: int,
+    history: list[dict],
+) -> None:
+    payload = {
+        "epoch": int(epoch),  # next epoch index to run
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "best_val": float(best_val),
+        "best_epoch": int(best_epoch),
+        "no_improve": int(no_improve),
+        "history": history,
+    }
+    tmp_path = f"{path}.tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _maybe_resume_training_state(
+    *,
+    args: argparse.Namespace,
+    model: torch.nn.Module,
+    optimizer: AdamW,
+    scheduler: CosineAnnealingLR,
+    scaler: GradScaler,
+) -> tuple[int, float, int, int, list[dict]]:
+    start_epoch = 0
+    best_val = float("inf")
+    best_epoch = -1
+    no_improve = 0
+    history: list[dict] = []
+
+    if args.resume_from is None:
+        return start_epoch, best_val, best_epoch, no_improve, history
+
+    resume_path = str(args.resume_from)
+    if not os.path.exists(resume_path):
+        raise FileNotFoundError(f"--resume-from checkpoint not found: {resume_path}")
+
+    print(f"Resuming from checkpoint: {resume_path}")
+    ckpt = torch.load(resume_path, map_location="cpu")
+    if not isinstance(ckpt, dict):
+        raise ValueError(
+            f"Unsupported checkpoint format at {resume_path}: expected dict, got {type(ckpt)}"
+        )
+
+    # Full training resume checkpoint (preferred)
+    if "model_state_dict" in ckpt:
+        model_state = _align_state_dict_prefix_for_model(
+            model,
+            ckpt["model_state_dict"],
+        )
+        model.load_state_dict(model_state, strict=True)
+
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        if "scaler_state_dict" in ckpt:
+            try:
+                scaler.load_state_dict(ckpt["scaler_state_dict"])
+            except Exception as e:
+                print(f"WARNING: failed to load scaler state from resume checkpoint: {e}")
+
+        start_epoch = int(ckpt.get("epoch", 0))
+        best_val = float(ckpt.get("best_val", float("inf")))
+        best_epoch = int(ckpt.get("best_epoch", -1))
+        no_improve = int(ckpt.get("no_improve", 0))
+        history_raw = ckpt.get("history", [])
+        history = list(history_raw) if isinstance(history_raw, list) else []
+        print(
+            f"  Resume state: start_epoch={start_epoch}, "
+            f"best_val={best_val:.6f}, best_epoch={best_epoch}, "
+            f"history_len={len(history)}"
+        )
+        return start_epoch, best_val, best_epoch, no_improve, history
+
+    # Backward-compat path: plain model state_dict only.
+    model_state = _align_state_dict_prefix_for_model(model, ckpt)
+    model.load_state_dict(model_state, strict=True)
+    print(
+        "  Loaded model weights only from --resume-from; optimizer/scheduler/scaler "
+        "state was not present. Training restarts from epoch 0."
+    )
+    return start_epoch, best_val, best_epoch, no_improve, history
+
+
 def _epoch_loss(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -1272,6 +1399,21 @@ def main() -> None:
     except TypeError:
         scaler = GradScaler(enabled=use_amp_loss)
 
+    resume_ckpt_path = os.path.join(args.output_dir, f"resume_checkpoint_{args.run_name}.pt")
+    (
+        start_epoch,
+        best_val,
+        best_epoch,
+        no_improve,
+        hist,
+    ) = _maybe_resume_training_state(
+        args=args,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+    )
+
     wandb_run = None
     if args.wandb:
         import wandb
@@ -1287,19 +1429,23 @@ def main() -> None:
                 "train_rows": int(len(train_ds)),
                 "val_rows": int(len(val_ds)),
                 "young_val_count": int(young_val_count),
+                "resume_from": args.resume_from,
             },
         )
 
-    best_val = float("inf")
-    best_epoch = -1
-    no_improve = 0
     ckpt_path = os.path.join(args.output_dir, f"best_model_{args.run_name}.pt")
-    hist = []
 
     t0 = time.time()
     if args.joint_curriculum:
         print("Using joint bin-first sampler (sample bin -> sample row uniformly within bin).")
-    for epoch in range(args.epochs):
+    if start_epoch > 0:
+        print(f"Continuing training from epoch {start_epoch + 1}/{args.epochs}")
+    if start_epoch >= args.epochs:
+        print(
+            f"Resume checkpoint start_epoch={start_epoch} is >= requested epochs={args.epochs}; "
+            "skipping optimization loop and writing run artifacts."
+        )
+    for epoch in range(start_epoch, args.epochs):
         curriculum_log = {}
         if args.joint_curriculum:
             tau = _compute_tau(epoch, args.epochs, args.tau_max, args.tau_warmup)
@@ -1512,6 +1658,19 @@ def main() -> None:
         else:
             no_improve += 1
 
+        _save_resume_checkpoint(
+            resume_ckpt_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            epoch=epoch + 1,
+            best_val=best_val,
+            best_epoch=best_epoch,
+            no_improve=no_improve,
+            history=hist,
+        )
+
         if no_improve >= args.patience:
             print(f"Early stopping at epoch {epoch + 1}; best epoch={best_epoch}, best val={best_val:.6f}")
             break
@@ -1534,6 +1693,9 @@ def main() -> None:
         "train_rows": int(len(train_ds)),
         "val_rows": int(len(val_ds)),
         "checkpoint_path": ckpt_path,
+        "resume_checkpoint_path": resume_ckpt_path,
+        "resumed_from": args.resume_from,
+        "start_epoch": int(start_epoch),
     }
     config_path = os.path.join(args.output_dir, f"posterior_config_{args.run_name}.json")
     with open(config_path, "w") as f:
