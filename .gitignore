@@ -4,6 +4,9 @@
 # Allow traversing directories
 !*/
 
+# Local tooling metadata
+.claude/
+
 # IDE metadata
 .idea/
 
