@@ -9,6 +9,8 @@ import torch
 from columns import ALL_VALUE_COLS, N_INTRINSIC, N_TRUE_MAG, NUM_NODES
 from columns import OBS_COLS, TRUE_MAG_COLS
 from sample_mock_galaxy import prepare_observations_from_cache, load_model
+from encoder import ObservationEncoder
+from posterior_models import ConditionalFMPosterior
 from transformer import Simformer
 
 
@@ -164,6 +166,26 @@ class TestLoadModelCheckpointCompat(unittest.TestCase):
             "dropout": 0.0,
         }
 
+    def _make_posterior_config(self):
+        return {
+            "method": "flow_matching",
+            "input_columns": [f"c{i}" for i in range(8)],
+            "theta_columns": ["c0", "c1", "c2"],
+            "dim_value": 4,
+            "dim_id": 4,
+            "dim_error": 2,
+            "dim_observed": 2,
+            "attn_embed_dim": 16,
+            "num_heads": 2,
+            "num_layers": 1,
+            "widening_factor": 2,
+            "dropout": 0.0,
+            "fm_hidden_dim": 16,
+            "time_embed_dim": 8,
+            "sigma_min": 1e-3,
+            "time_prior_exponent": 0.0,
+        }
+
     def test_load_model_accepts_prefixed_compiled_state_dict(self):
         run_name = "testrun"
         config = self._make_config()
@@ -181,6 +203,54 @@ class TestLoadModelCheckpointCompat(unittest.TestCase):
             loaded_model, stats = load_model(td, run_name=run_name, device="cpu")
 
         self.assertEqual(stats.num_nodes, config["num_nodes"])
+        loaded_state = loaded_model.state_dict()
+        for k, v in base_state.items():
+            torch.testing.assert_close(loaded_state[k], v)
+
+    def test_load_model_supports_posterior_artifact_layout(self):
+        run_name = "testrun"
+        config = self._make_posterior_config()
+
+        encoder = ObservationEncoder(
+            input_columns=config["input_columns"],
+            dim_value=config["dim_value"],
+            dim_id=config["dim_id"],
+            value_calibration_type="scalar_film",
+            dim_error=config["dim_error"],
+            error_embed_type="mlp_regime",
+            dim_observed=config["dim_observed"],
+            attn_embed_dim=config["attn_embed_dim"],
+            num_heads=config["num_heads"],
+            num_layers=config["num_layers"],
+            widening_factor=config["widening_factor"],
+            dropout=config["dropout"],
+            use_missingness_context=False,
+            missingness_context_hidden_dim=64,
+        )
+        model = ConditionalFMPosterior(
+            encoder=encoder,
+            theta_dim=len(config["theta_columns"]),
+            hidden_dim=config["fm_hidden_dim"],
+            time_embed_dim=config["time_embed_dim"],
+            sigma_min=config["sigma_min"],
+            time_prior_exponent=config["time_prior_exponent"],
+            dropout=config["dropout"],
+        )
+        base_state = model.state_dict()
+        prefixed_state = {f"_orig_mod.{k}": v.clone() for k, v in base_state.items()}
+
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, f"posterior_config_{run_name}.json"), "w") as f:
+                json.dump(config, f)
+            torch.save(prefixed_state, os.path.join(td, f"best_model_{run_name}.pt"))
+            self._write_norm_stats(
+                os.path.join(td, f"posterior_norm_meta_{run_name}.npz"),
+                len(config["input_columns"]),
+            )
+
+            loaded_model, stats = load_model(td, run_name=run_name, device="cpu")
+
+        self.assertEqual(stats.num_nodes, len(config["input_columns"]))
         loaded_state = loaded_model.state_dict()
         for k, v in base_state.items():
             torch.testing.assert_close(loaded_state[k], v)

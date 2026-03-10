@@ -39,6 +39,8 @@ from columns import (
 from prepare_data import galactic_to_unitvec
 from transformer import Simformer
 from inference_utils import NormStats
+from encoder import ObservationEncoder
+from posterior_models import ConditionalFMPosterior, ConditionalFlowPosterior
 from sampling import (
     build_inference_edge_mask,
     build_inference_condition_mask,
@@ -97,37 +99,132 @@ def _upgrade_legacy_binary_state_embeddings(state_dict):
         print(f"  Upgraded legacy {name} embedding checkpoint tensor to 2-state table.")
 
 
+def _load_state_dict(path, device):
+    try:
+        state_dict = torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        state_dict = torch.load(path, map_location=device)
+    # Handle checkpoints saved from torch.compile.
+    if state_dict and all(str(k).startswith("_orig_mod.") for k in state_dict.keys()):
+        state_dict = {k[len("_orig_mod."):]: v for k, v in state_dict.items()}
+    return state_dict
+
+
+def _build_posterior_model_from_config(config, input_columns):
+    theta_columns = [str(c) for c in config["theta_columns"]]
+    encoder = ObservationEncoder(
+        input_columns=[str(c) for c in input_columns],
+        dim_value=int(config.get("dim_value", 24)),
+        dim_id=int(config.get("dim_id", 24)),
+        value_calibration_type=str(config.get("value_calibration_type", "scalar_film")),
+        dim_error=int(config.get("dim_error", 16)),
+        error_embed_type=str(config.get("error_embed_type", "mlp_regime")),
+        dim_observed=int(config.get("dim_observed", 8)),
+        attn_embed_dim=int(config.get("attn_embed_dim", 128)),
+        num_heads=int(config.get("num_heads", 8)),
+        num_layers=int(config.get("num_layers", 4)),
+        widening_factor=int(config.get("widening_factor", 4)),
+        dropout=float(config.get("dropout", 0.05)),
+        use_missingness_context=bool(config.get("use_missingness_context", False)),
+        missingness_context_hidden_dim=int(config.get("missingness_context_hidden_dim", 64)),
+    )
+    method = str(config.get("method", "flow_matching"))
+    if method == "flow_matching":
+        return ConditionalFMPosterior(
+            encoder=encoder,
+            theta_dim=len(theta_columns),
+            hidden_dim=int(config.get("fm_hidden_dim", 256)),
+            time_embed_dim=int(config.get("time_embed_dim", 64)),
+            sigma_min=float(config.get("sigma_min", 1e-3)),
+            time_prior_exponent=float(config.get("time_prior_exponent", 0.0)),
+            dropout=float(config.get("dropout", 0.05)),
+        )
+    if method in ("realnvp", "normalizing_flow"):
+        return ConditionalFlowPosterior(
+            encoder=encoder,
+            theta_dim=len(theta_columns),
+            backend=str(config.get("nf_backend", "zuko")),
+            flow_family=str(config.get("nf_family", "nsf")),
+            num_transforms=int(config.get("nf_num_coupling_layers", 8)),
+            hidden_dim=int(config.get("nf_hidden_dim", 256)),
+            dropout=float(config.get("dropout", 0.05)),
+        )
+    raise ValueError(f"Unsupported method '{method}' in posterior config.")
+
+
 def load_model(model_dir, run_name="default", device="cpu"):
-    """Load a trained SimFormer model and normalization statistics.
+    """Load a trained model and normalization statistics.
 
     Args:
-        model_dir: Directory containing model config, checkpoint, and norm stats.
+        model_dir: Directory containing model artifacts and normalization stats.
         run_name: Run name used during training (determines checkpoint and config filenames).
         device: Target device.
 
     Returns:
-        model: Simformer model with loaded weights.
+        model: Loaded model with weights.
         norm_stats: NormStats instance.
-    """
-    # Load architecture config saved during training
-    config_path = os.path.join(model_dir, f"model_config_{run_name}.json")
-    with open(config_path) as f:
-        config = json.load(f)
-    print(f"  Model config loaded from {config_path}")
-    model = Simformer(**_simformer_kwargs_from_config(config))
 
+    Supports two artifact layouts:
+      1) Legacy SimFormer training:
+         - model_config_<run_name>.json
+         - best_model_<run_name>.pt
+         - norm_stats.npz
+      2) SBI posterior training (train_sbi_posterior.py):
+         - posterior_config_<run_name>.json
+         - best_model_<run_name>.pt
+         - posterior_norm_meta_<run_name>.npz
+    """
     ckpt_path = os.path.join(model_dir, f"best_model_{run_name}.pt")
-    state_dict = torch.load(ckpt_path, map_location=device, weights_only=True)
-    # Handle checkpoints saved from torch.compile, where keys are prefixed
-    # with "_orig_mod." (e.g. "_orig_mod.tokenizer...").
-    if state_dict and all(k.startswith("_orig_mod.") for k in state_dict.keys()):
-        state_dict = {k[len("_orig_mod."):]: v for k, v in state_dict.items()}
-    _upgrade_legacy_binary_state_embeddings(state_dict)
-    model.load_state_dict(state_dict)
+    legacy_cfg_path = os.path.join(model_dir, f"model_config_{run_name}.json")
+    posterior_cfg_path = os.path.join(model_dir, f"posterior_config_{run_name}.json")
+
+    if os.path.exists(legacy_cfg_path):
+        with open(legacy_cfg_path) as f:
+            config = json.load(f)
+        print(f"  Model config loaded from {legacy_cfg_path}")
+        model = Simformer(**_simformer_kwargs_from_config(config))
+        state_dict = _load_state_dict(ckpt_path, device=device)
+        _upgrade_legacy_binary_state_embeddings(state_dict)
+        model.load_state_dict(state_dict)
+        norm_stats = NormStats(os.path.join(model_dir, "norm_stats.npz"))
+    elif os.path.exists(posterior_cfg_path):
+        with open(posterior_cfg_path) as f:
+            config = json.load(f)
+        print(f"  Posterior config loaded from {posterior_cfg_path}")
+        meta_path = os.path.join(model_dir, f"posterior_norm_meta_{run_name}.npz")
+        if not os.path.exists(meta_path):
+            fallback_meta = os.path.join(model_dir, "norm_stats.npz")
+            if os.path.exists(fallback_meta):
+                meta_path = fallback_meta
+            else:
+                raise FileNotFoundError(
+                    "No normalization metadata found for posterior artifacts. "
+                    f"Expected {meta_path} (or fallback {fallback_meta})."
+                )
+        norm_stats = NormStats(meta_path)
+        input_columns = config.get("input_columns_with_colors")
+        if input_columns is None:
+            input_columns = (
+                norm_stats.input_columns_meta
+                if norm_stats.input_columns_meta is not None
+                else config.get("input_columns")
+            )
+        if input_columns is None:
+            raise ValueError(
+                "posterior_config is missing input column metadata "
+                "(input_columns or input_columns_with_colors)."
+            )
+        model = _build_posterior_model_from_config(config, input_columns=input_columns)
+        state_dict = _load_state_dict(ckpt_path, device=device)
+        model.load_state_dict(state_dict)
+    else:
+        raise FileNotFoundError(
+            f"Could not find model config for run '{run_name}' in {model_dir}. "
+            f"Expected either {legacy_cfg_path} or {posterior_cfg_path}."
+        )
+
     model.to(device)
     model.eval()
-
-    norm_stats = NormStats(os.path.join(model_dir, "norm_stats.npz"))
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  Model loaded: {n_params:,} parameters from {ckpt_path}")
     return model, norm_stats
