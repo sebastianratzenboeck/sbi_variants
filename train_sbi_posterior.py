@@ -53,6 +53,10 @@ _REQUIRED_POSITIVE_TRANSFORMS = {
     "rad": "log_shifted_pos",
     "Av": "log1p_pos",
 }
+_FM_LEGACY_CLIP_MIN = 0.5
+_FM_LEGACY_CLIP_MAX = 2.0
+_FM_WIDE_CLIP_MIN = 0.1
+_FM_WIDE_CLIP_MAX = 10.0
 
 
 class _JointBinFirstSampler(Sampler[int]):
@@ -309,6 +313,17 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Number of logAge bins for joint curriculum.")
     p.add_argument("--n-mass-bins", type=int, default=12,
                    help="Number of m_init bins for joint curriculum.")
+    p.add_argument(
+        "--curriculum-bin-strategy",
+        type=str,
+        default="quantile",
+        choices=["quantile", "equal_width"],
+        help=(
+            "Binning strategy for (logAge,m_init) curriculum space. "
+            "'quantile' yields balanced bin populations; 'equal_width' "
+            "uses fixed-width bins in standardized space."
+        ),
+    )
     p.add_argument("--tau-max", type=float, default=0.8,
                    help="Max tau in curriculum schedule (tau=0 => uniform bins, tau=1 => natural bins).")
     p.add_argument("--tau-warmup", type=int, default=10,
@@ -451,6 +466,10 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"--n-bins must be > 0, got {args.n_bins}")
     if args.n_mass_bins <= 0:
         parser.error(f"--n-mass-bins must be > 0, got {args.n_mass_bins}")
+    if not (0.0 <= args.tau_max <= 1.0):
+        parser.error(f"--tau-max must be in [0,1], got {args.tau_max}")
+    if args.tau_warmup < 0:
+        parser.error(f"--tau-warmup must be >= 0, got {args.tau_warmup}")
     if args.curriculum_epoch_size < 0:
         parser.error(
             f"--curriculum-epoch-size must be >= 0, got {args.curriculum_epoch_size}"
@@ -487,6 +506,17 @@ def parse_args() -> argparse.Namespace:
         )
     if args.nll_cap < 0:
         parser.error(f"--nll-cap must be >= 0, got {args.nll_cap}")
+    args.fm_clip_auto_widened = False
+    if (
+        args.method == "flow_matching"
+        and args.importance_weighting
+        and np.isclose(args.importance_weight_beta, 0.25)
+        and np.isclose(args.importance_weight_min, _FM_LEGACY_CLIP_MIN)
+        and np.isclose(args.importance_weight_max, _FM_LEGACY_CLIP_MAX)
+    ):
+        args.importance_weight_min = _FM_WIDE_CLIP_MIN
+        args.importance_weight_max = _FM_WIDE_CLIP_MAX
+        args.fm_clip_auto_widened = True
     return args
 
 
@@ -553,6 +583,8 @@ def _prepare_joint_curriculum_state(
     theta_columns: list[str],
     n_age_bins: int,
     n_mass_bins: int,
+    *,
+    bin_strategy: str = "quantile",
 ) -> dict[str, np.ndarray | float | int]:
     try:
         age_idx = theta_columns.index("logAge")
@@ -574,8 +606,26 @@ def _prepare_joint_curriculum_state(
         raise ValueError(
             f"Joint curriculum input has {n_bad} non-finite m_init values."
         )
-    age_edges = np.linspace(age.min(), age.max() + 1e-6, n_age_bins + 1)
-    mass_edges = np.linspace(mass.min(), mass.max() + 1e-6, n_mass_bins + 1)
+    def _build_edges(values: np.ndarray, n_bins: int, strategy: str) -> np.ndarray:
+        values = values.astype(np.float64, copy=False)
+        if strategy == "equal_width":
+            return np.linspace(values.min(), values.max() + 1e-6, n_bins + 1)
+        if strategy != "quantile":
+            raise ValueError(f"Unsupported curriculum bin strategy: {strategy}")
+        edges = np.quantile(values, np.linspace(0.0, 1.0, n_bins + 1)).astype(np.float64)
+        vmin = float(values.min())
+        vmax = float(values.max())
+        eps = max(np.finfo(np.float64).eps * max(abs(vmin), abs(vmax), 1.0), 1e-12)
+        edges[0] = vmin
+        for i in range(1, edges.size):
+            if edges[i] <= edges[i - 1]:
+                edges[i] = edges[i - 1] + eps
+        if edges[-1] <= vmax:
+            edges[-1] = vmax + eps
+        return edges
+
+    age_edges = _build_edges(age, n_age_bins, bin_strategy)
+    mass_edges = _build_edges(mass, n_mass_bins, bin_strategy)
 
     age_bin = np.digitize(age, age_edges) - 1
     mass_bin = np.digitize(mass, mass_edges) - 1
@@ -646,9 +696,19 @@ def _cache_column_physical_values(
 
 
 def _validate_curriculum_space_assumptions(
-    cache: CacheArrays, theta_columns: list[str],
+    cache: CacheArrays,
+    theta_columns: list[str],
+    *,
+    bin_strategy: str,
 ) -> None:
     """Validate assumptions behind binning directly on normalized theta arrays."""
+    if bin_strategy == "quantile":
+        # Quantile binning depends only on rank and is robust to affine scaling.
+        # Keep transform checks only for equal-width bins.
+        return
+    if bin_strategy != "equal_width":
+        raise ValueError(f"Unsupported curriculum bin strategy: {bin_strategy}")
+
     if cache.means is None or cache.stds is None:
         raise ValueError(
             "Joint curriculum requires cache means/stds metadata for robust "
@@ -1027,6 +1087,8 @@ def _epoch_loss(
             (unweighted, uncapped).  Comparable across different sampling
             distributions.
         ``"n_samples"`` – total number of samples processed.
+        ``"ess"`` – effective sample size induced by per-sample weights.
+        ``"ess_ratio"`` – ESS divided by ``n_samples``.
     """
     if train:
         model.train()
@@ -1037,6 +1099,8 @@ def _epoch_loss(
     total_weighted_den = 0.0   # accumulates sum(w) across batches
     total_nll = 0.0
     total_samples = 0
+    total_w = 0.0
+    total_w2 = 0.0
     # Only apply the smooth NLL cap during training (backprop stabilisation);
     # evaluation always uses raw NLL so that monitored metrics are unbiased.
     effective_cap = nll_cap if train else 0.0
@@ -1075,12 +1139,24 @@ def _epoch_loss(
         total_weighted_den += result.w_sum
         total_nll += float(result.nll_sum.item())
         total_samples += result.n_samples
+        batch_w = batch.get("sample_weight")
+        if batch_w is None:
+            n_batch = int(result.n_samples)
+            total_w += float(n_batch)
+            total_w2 += float(n_batch)
+        else:
+            w = batch_w.detach().float().reshape(-1)
+            total_w += float(w.sum().item())
+            total_w2 += float((w * w).sum().item())
 
     n = max(total_samples, 1)
+    ess = (total_w * total_w) / max(total_w2, 1e-8)
     return {
         "weighted": total_weighted_num / max(total_weighted_den, 1e-8),
         "nll_mean": total_nll / n,
         "n_samples": total_samples,
+        "ess": ess,
+        "ess_ratio": ess / n,
     }
 
 
@@ -1126,6 +1202,12 @@ def main() -> None:
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    if getattr(args, "fm_clip_auto_widened", False):
+        print(
+            "Flow-matching clip bounds auto-widened from "
+            f"[{_FM_LEGACY_CLIP_MIN}, {_FM_LEGACY_CLIP_MAX}] to "
+            f"[{_FM_WIDE_CLIP_MIN}, {_FM_WIDE_CLIP_MAX}] for beta=0.25."
+        )
 
     cache_path = _ensure_cache(args)
     args.cache_path = cache_path
@@ -1211,24 +1293,44 @@ def main() -> None:
     train_ds = SBIDataset(arr_train)
     val_ds = SBIDataset(arr_val)
     pin_memory = (device != "cpu" and torch.cuda.is_available())
+    curriculum_uses_ramp = False
     if args.joint_curriculum:
-        _validate_curriculum_space_assumptions(cache, theta_columns)
+        _validate_curriculum_space_assumptions(
+            cache,
+            theta_columns,
+            bin_strategy=args.curriculum_bin_strategy,
+        )
         curriculum_state = _prepare_joint_curriculum_state(
             theta=arr_train.theta,
             theta_columns=theta_columns,
             n_age_bins=args.n_bins,
             n_mass_bins=args.n_mass_bins,
+            bin_strategy=args.curriculum_bin_strategy,
         )
         n_train_samples_per_epoch = (
             int(args.curriculum_epoch_size)
             if args.curriculum_epoch_size > 0
             else int(len(train_ds))
         )
+        curriculum_uses_ramp = bool(args.tau_max > 0.0)
+        if curriculum_uses_ramp:
+            schedule_msg = (
+                f"ramp(tau_warmup={args.tau_warmup}, tau_max={args.tau_max:.3f})"
+            )
+        else:
+            if args.tau_warmup > 0:
+                print(
+                    "WARNING: tau_max=0.0 puts curriculum in fixed-uniform mode; "
+                    "--tau-warmup has no effect."
+                )
+            schedule_msg = "fixed_uniform(tau=0.0)"
         print(
             "Joint curriculum enabled: "
             f"age_bins={args.n_bins}, mass_bins={args.n_mass_bins}, "
+            f"bin_strategy={args.curriculum_bin_strategy}, "
             f"active_bins={curriculum_state['n_active']}, "
             f"epoch_samples={n_train_samples_per_epoch}, "
+            f"schedule={schedule_msg}, "
             f"importance_weighting={args.importance_weighting}"
         )
         train_loader = None
@@ -1350,6 +1452,7 @@ def main() -> None:
                 theta_columns=theta_columns,
                 n_age_bins=args.n_bins,
                 n_mass_bins=args.n_mass_bins,
+                bin_strategy=args.curriculum_bin_strategy,
             )
             val_curriculum_ds = SBIDataset(arr_val)
             n_val_curr_samples_per_epoch = (
@@ -1447,8 +1550,10 @@ def main() -> None:
         )
     for epoch in range(start_epoch, args.epochs):
         curriculum_log = {}
+        tau = 0.0
         if args.joint_curriculum:
-            tau = _compute_tau(epoch, args.epochs, args.tau_max, args.tau_warmup)
+            if curriculum_uses_ramp:
+                tau = _compute_tau(epoch, args.epochs, args.tau_max, args.tau_warmup)
             q_bin, w_i, lam, clip_frac = _joint_curriculum_distributions(
                 curriculum_state,
                 tau=tau,
@@ -1481,6 +1586,8 @@ def main() -> None:
                 "train_importance_weight_mean": float(w_i.mean()),
                 "train_importance_weight_max": float(w_i.max()),
                 "train_weight_clip_frac": float(clip_frac),
+                "train_ess": float("nan"),
+                "train_ess_ratio": float("nan"),
             }
         else:
             epoch_train_loader = train_loader
@@ -1502,6 +1609,11 @@ def main() -> None:
         # monitor training progress, but not for model selection.
         train_nll_q = train_result["nll_mean"]
         train_loss_optim = train_result["weighted"]  # the actual backprop objective
+        train_ess = train_result["ess"]
+        train_ess_ratio = train_result["ess_ratio"]
+        if args.joint_curriculum:
+            curriculum_log["train_ess"] = float(train_ess)
+            curriculum_log["train_ess_ratio"] = float(train_ess_ratio)
 
         train_nll_p_random = None
         if train_random_loader is not None:
@@ -1590,6 +1702,8 @@ def main() -> None:
                 if train_nll_p_random is None
                 else float(train_nll_p_random),
                 "train_loss_optim": float(train_loss_optim),
+                "train_ess": float(train_ess),
+                "train_ess_ratio": float(train_ess_ratio),
                 "val_loss": float(val_loss),
                 "val_loss_curriculum": None
                 if val_loss_curriculum is None
@@ -1617,7 +1731,9 @@ def main() -> None:
                 f"w[min/mean/max]={curriculum_log['train_importance_weight_min']:.3f}/"
                 f"{curriculum_log['train_importance_weight_mean']:.3f}/"
                 f"{curriculum_log['train_importance_weight_max']:.3f}, "
-                f"clip_frac={curriculum_log['train_weight_clip_frac']:.4f}"
+                f"clip_frac={curriculum_log['train_weight_clip_frac']:.4f}, "
+                f"ess/N={curriculum_log['train_ess_ratio']:.4f} "
+                f"(ess={curriculum_log['train_ess']:.1f})"
             )
         extra_eval_parts = []
         if val_loss_curriculum is not None:
@@ -1636,6 +1752,8 @@ def main() -> None:
                 if train_nll_p_random is None
                 else float(train_nll_p_random),
                 "train_loss_optim": train_loss_optim,
+                "train_ess": train_ess,
+                "train_ess_ratio": train_ess_ratio,
                 "val_loss": val_loss,
                 "lr": lr,
                 "val_loss_young": float("nan")

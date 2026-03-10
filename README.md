@@ -114,6 +114,8 @@ Compatibility note: `--method realnvp` is kept as an alias for `normalizing_flow
 For rare-regime retention (e.g., young/high-mass) while keeping control over optimisation stability:
 
 - Joint `(logAge, m_init)` curriculum sampling is enabled by default.
+- Joint curriculum binning defaults to `quantile` bins in `train_sbi_posterior.py`
+  (`--curriculum-bin-strategy quantile`) for more balanced bin populations.
 - Importance correction is enabled by default with tempered exponent `w=(p/q)^beta`.
 - Recommended NF defaults use:
   - `importance_weight_beta=0.5`
@@ -152,6 +154,16 @@ python sbi_variants/train_sbi_posterior.py \
 ```
 
 `train_weight_clip_frac` is logged to console/wandb; it should stay near 0. Persistently high values mean clamp bounds are actively distorting the objective.
+
+Flow-matching note (runtime compatibility behavior):
+
+- For `--method flow_matching`, if all of the following are true:
+  - `importance_weighting=true`
+  - `importance_weight_beta=0.25`
+  - legacy clip bounds `importance_weight_min=0.5`, `importance_weight_max=2.0`
+- then the trainer automatically widens bounds at runtime to
+  `importance_weight_min=0.1`, `importance_weight_max=10.0` and prints a notice.
+- This keeps legacy configs runnable while avoiding overly tight clipping in that regime.
 
 
 ## Metric semantics (NF/FM trainer)
