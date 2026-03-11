@@ -1,6 +1,13 @@
 # Config Notes
 
-These JSON files are consumed directly by `train_sbi_posterior.py`.
+Most JSON files are consumed by `train_sbi_posterior.py`.
+`train_nre_balanced_theta.json` is consumed by `train_sbi_nre.py`.
+
+`train_nre_balanced_theta.json` also includes optional joint curriculum keys:
+- `joint_curriculum`
+- `n_bins`, `n_mass_bins`, `curriculum_bin_strategy`
+- `tau_max`, `tau_warmup`, `curriculum_epoch_size`
+- `curriculum_importance_weighting` (+ beta/min/max)
 They must stay strict JSON (no inline comments), so notes are documented here.
 
 ## Curriculum / Binning

@@ -20,6 +20,13 @@ Both train and sample scripts support:
 - `normalizing_flow`: package-backed conditional flow in theta-space.
   - backend `zuko` (recommended default)
   - backend `nflows` (supported option)
+- `nre` (separate trainer): classifier-based ratio estimation in theta-space.
+  - Standard NRE (`--ratio-mask-mode none`)
+  - AMNRE-style masking (`--ratio-mask-mode amnre_k_uniform` or `amnre_bernoulli`)
+  - BNRE balancing regularizer (`--use-balanced-loss --bnre-lambda 100`)
+  - Optional K&F-inspired per-pair weighting (`--importance-mode kf_logit_grad`)
+  - Optional joint bin-first sampler over `(logAge,m_init)` for rare-bin upsampling
+    (`--joint-curriculum --n-bins --n-mass-bins --tau-max`)
 
 Both variants reuse existing tokenizer/transformer components from:
 
@@ -108,6 +115,49 @@ python train_variant_sbi_nf_theta.py \
 ```
 
 Compatibility note: `--method realnvp` is kept as an alias for `normalizing_flow`.
+
+## NRE / AMNRE / BNRE training
+
+Dedicated trainer:
+
+```bash
+python train_sbi_nre.py \
+  --config configs/train_nre_balanced_theta.json \
+  --cache-path /path/to/build_arrays_cache.npz \
+  --exclude-indices /path/to/test_indices.npy \
+  --output-dir /path/to/output \
+  --run-name nre_balanced_theta \
+  --device cuda
+```
+
+To force strong rare-bin exposure (young/massive), use:
+
+```bash
+python train_sbi_nre.py \
+  --config configs/train_nre_balanced_theta.json \
+  --joint-curriculum \
+  --tau-max 0.0 \
+  --no-curriculum-importance-weighting
+```
+
+(`tau=0` means approximately uniform-over-active-bins sampling.)
+
+One-line launcher (uses `configs/train_nre_balanced_theta.json` by default):
+
+```bash
+python train_variant_sbi_nre_theta.py \
+  --cache-path /path/to/build_arrays_cache.npz \
+  --exclude-indices /path/to/test_indices.npy \
+  --output-dir /path/to/output \
+  --run-name nre_balanced_theta
+```
+
+Artifact names from the NRE trainer:
+
+- `best_ratio_model_<run_name>.pt`
+- `ratio_config_<run_name>.json`
+- `ratio_history_<run_name>.json`
+- `ratio_norm_meta_<run_name>.npz`
 
 ## Joint curriculum + importance correction
 
