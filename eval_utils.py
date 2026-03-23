@@ -10,7 +10,10 @@ import numpy as np
 import pandas as pd
 import torch
 
-from columns import ALL_VALUE_COLS, INTRINSIC_COLS, OBS_COLS
+try:
+    from .columns import ALL_VALUE_COLS, INTRINSIC_COLS, OBS_COLS
+except ImportError:
+    from columns import ALL_VALUE_COLS, INTRINSIC_COLS, OBS_COLS
 
 
 LOG_ERR_UNOBS = 5.0

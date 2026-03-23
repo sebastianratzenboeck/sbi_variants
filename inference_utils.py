@@ -9,12 +9,20 @@ numpy arrays.
 import numpy as np
 import torch
 from typing import Optional, Sequence, Union
-from value_transforms import (
-    apply_forward_value_transforms_numpy,
-    apply_forward_value_transforms_torch,
-    apply_inverse_value_transforms_numpy,
-    apply_inverse_value_transforms_torch,
-)
+try:
+    from .value_transforms import (
+        apply_forward_value_transforms_numpy,
+        apply_forward_value_transforms_torch,
+        apply_inverse_value_transforms_numpy,
+        apply_inverse_value_transforms_torch,
+    )
+except ImportError:
+    from value_transforms import (
+        apply_forward_value_transforms_numpy,
+        apply_forward_value_transforms_torch,
+        apply_inverse_value_transforms_numpy,
+        apply_inverse_value_transforms_torch,
+    )
 
 _REQUIRED_POSITIVE_TRANSFORMS = {
     "rad": "log_shifted_pos",

@@ -18,15 +18,26 @@ if __package__ in (None, ""):
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-from columns import COLOR_DEFINITIONS, OBS_COLS, OBS_ERR_COLS
-from inference_utils import NormStats
-from prepare_data import galactic_to_unitvec
-from sbi_variants.data import column_indices, compute_colors_from_cache, load_cache_arrays
-from sbi_variants.encoder import ObservationEncoder
-from sbi_variants.posterior_models import (
-    ConditionalFMPosterior,
-    ConditionalFlowPosterior,
-)
+try:
+    from .columns import COLOR_DEFINITIONS, OBS_COLS, OBS_ERR_COLS
+    from .inference_utils import NormStats
+    from .prepare_data import galactic_to_unitvec
+    from .data import column_indices, compute_colors_from_cache, load_cache_arrays
+    from .encoder import ObservationEncoder
+    from .posterior_models import (
+        ConditionalFMPosterior,
+        ConditionalFlowPosterior,
+    )
+except ImportError:
+    from columns import COLOR_DEFINITIONS, OBS_COLS, OBS_ERR_COLS
+    from inference_utils import NormStats
+    from prepare_data import galactic_to_unitvec
+    from sbi_variants.data import column_indices, compute_colors_from_cache, load_cache_arrays
+    from sbi_variants.encoder import ObservationEncoder
+    from sbi_variants.posterior_models import (
+        ConditionalFMPosterior,
+        ConditionalFlowPosterior,
+    )
 
 
 OBS_ERROR_FLOOR = 1e-6

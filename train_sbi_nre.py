@@ -12,6 +12,7 @@ from typing import Iterator
 import numpy as np
 import torch
 import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Sampler
@@ -24,25 +25,46 @@ if __package__ in (None, ""):
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-from data import (
-    DEFAULT_INPUT_COLS,
-    DEFAULT_THETA_COLS,
-    SBIDataset,
-    build_row_split,
-    build_sbi_arrays,
-    load_cache_arrays,
-    load_indices,
-    parse_column_csv,
-)
-from encoder import ObservationEncoder
-from ratio_models import ConditionalRatioEstimator
-from train_mock_galaxy import (
-    DEFAULT_CLUSTER_ID_COL,
-    build_arrays as build_cache_arrays,
-    load_data as load_raw_data,
-    save_arrays as save_cache_arrays,
-)
-from value_transforms import apply_inverse_value_transforms_numpy
+try:
+    from .data import (
+        DEFAULT_INPUT_COLS,
+        DEFAULT_THETA_COLS,
+        SBIDataset,
+        build_row_split,
+        build_sbi_arrays,
+        load_cache_arrays,
+        load_indices,
+        parse_column_csv,
+    )
+    from .encoder import ObservationEncoder
+    from .ratio_models import ConditionalRatioEstimator
+    from .train_mock_galaxy import (
+        DEFAULT_CLUSTER_ID_COL,
+        build_arrays as build_cache_arrays,
+        load_data as load_raw_data,
+        save_arrays as save_cache_arrays,
+    )
+    from .value_transforms import apply_inverse_value_transforms_numpy
+except ImportError:
+    from data import (
+        DEFAULT_INPUT_COLS,
+        DEFAULT_THETA_COLS,
+        SBIDataset,
+        build_row_split,
+        build_sbi_arrays,
+        load_cache_arrays,
+        load_indices,
+        parse_column_csv,
+    )
+    from encoder import ObservationEncoder
+    from ratio_models import ConditionalRatioEstimator
+    from train_mock_galaxy import (
+        DEFAULT_CLUSTER_ID_COL,
+        build_arrays as build_cache_arrays,
+        load_data as load_raw_data,
+        save_arrays as save_cache_arrays,
+    )
+    from value_transforms import apply_inverse_value_transforms_numpy
 
 try:
     from torch.amp import GradScaler, autocast
@@ -262,6 +284,83 @@ def _prepare_joint_curriculum_state(
     }
 
 
+def _compute_test_split_with_cluster_holdout(
+    n_total: int,
+    test_split: float,
+    *,
+    cluster_ids: np.ndarray | None = None,
+    test_cluster_frac: float = 0.0,
+    random_state: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (trainval_indices, test_indices, heldout_cluster_ids)."""
+    all_indices = np.arange(n_total, dtype=np.int64)
+    rng = np.random.RandomState(random_state)
+
+    if (cluster_ids is None) or (test_cluster_frac <= 0.0):
+        if test_split <= 0.0:
+            return (
+                all_indices.astype(np.int64),
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.int64),
+            )
+        trainval_idx, test_idx = train_test_split(
+            all_indices, test_size=test_split, random_state=random_state,
+        )
+        return (
+            trainval_idx.astype(np.int64),
+            test_idx.astype(np.int64),
+            np.array([], dtype=np.int64),
+        )
+
+    cluster_ids = np.asarray(cluster_ids)
+    if cluster_ids.shape[0] != n_total:
+        raise ValueError(
+            f"cluster_ids length mismatch: got {cluster_ids.shape[0]}, expected {n_total}"
+        )
+
+    unique_clusters = np.unique(cluster_ids[cluster_ids > 0])
+    if unique_clusters.size == 0:
+        print("WARNING: no positive cluster IDs found; falling back to random test split.")
+        if test_split <= 0.0:
+            return (
+                all_indices.astype(np.int64),
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.int64),
+            )
+        trainval_idx, test_idx = train_test_split(
+            all_indices, test_size=test_split, random_state=random_state,
+        )
+        return (
+            trainval_idx.astype(np.int64),
+            test_idx.astype(np.int64),
+            np.array([], dtype=np.int64),
+        )
+
+    n_holdout_clusters = int(round(float(test_cluster_frac) * float(unique_clusters.size)))
+    n_holdout_clusters = max(1, min(n_holdout_clusters, int(unique_clusters.size)))
+    heldout_clusters = np.sort(
+        rng.choice(unique_clusters, size=n_holdout_clusters, replace=False).astype(np.int64)
+    )
+    is_cluster_test = np.isin(cluster_ids, heldout_clusters)
+    test_idx_cluster = all_indices[is_cluster_test]
+    remaining_idx = all_indices[~is_cluster_test]
+
+    desired_test_count = int(round(float(test_split) * float(n_total)))
+    desired_test_count = max(desired_test_count, len(test_idx_cluster))
+
+    n_needed = desired_test_count - len(test_idx_cluster)
+    if n_needed > 0 and len(remaining_idx) > 0:
+        n_needed = min(n_needed, len(remaining_idx))
+        extra_test = rng.choice(remaining_idx, size=n_needed, replace=False).astype(np.int64)
+        test_idx = np.concatenate([test_idx_cluster, extra_test])
+    else:
+        test_idx = test_idx_cluster
+
+    test_idx = np.unique(test_idx.astype(np.int64))
+    trainval_idx = all_indices[~np.isin(all_indices, test_idx)].astype(np.int64)
+    return trainval_idx, test_idx, heldout_clusters
+
+
 def _joint_curriculum_distributions(
     state: dict[str, np.ndarray | float | int],
     tau: float,
@@ -330,6 +429,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--theta-columns", type=str, default=",".join(DEFAULT_THETA_COLS))
     p.add_argument("--exclude-indices", type=str, default=None,
                    help="Optional .npy indices excluded from train/val (e.g. test_indices.npy).")
+    p.add_argument(
+        "--test-split",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional test holdout fraction in [0,1). Held-out rows are excluded from train/val "
+            "and saved to output_dir/test_indices.npy (ignored when --exclude-indices is provided)."
+        ),
+    )
+    p.add_argument(
+        "--test-cluster-frac",
+        type=float,
+        default=0.0,
+        help=(
+            "If >0, hold out this fraction of unique positive cluster IDs as full clusters for test "
+            "(requires cache to contain cluster_ids metadata; ignored when --exclude-indices is provided)."
+        ),
+    )
     p.add_argument("--val-split", type=float, default=0.1)
     p.add_argument("--max-stars", type=int, default=None)
     p.add_argument("--seed", type=int, default=42)
@@ -518,6 +635,10 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--tau-max must be in [0,1].")
     if args.tau_warmup < 0:
         raise ValueError("--tau-warmup must be >=0.")
+    if not (0.0 <= args.test_split < 1.0):
+        raise ValueError(f"--test-split must be in [0,1), got {args.test_split}")
+    if not (0.0 <= args.test_cluster_frac <= 1.0):
+        raise ValueError(f"--test-cluster-frac must be in [0,1], got {args.test_cluster_frac}")
     if args.mask_bernoulli_p <= 0 or args.mask_bernoulli_p >= 1:
         raise ValueError("--mask-bernoulli-p must be in (0,1).")
     if args.bnre_lambda < 0:
@@ -1008,7 +1129,43 @@ def main() -> None:
     if len(theta_columns) == 0:
         raise ValueError("theta_columns resolved to empty list.")
 
-    exclude_idx = load_indices(args.exclude_indices)
+    generated_test_idx_path = None
+    generated_test_cluster_ids_path = None
+    if args.exclude_indices is not None:
+        exclude_idx = load_indices(args.exclude_indices)
+        if args.test_split > 0.0 or args.test_cluster_frac > 0.0:
+            print(
+                "WARNING: --exclude-indices is set; ignoring --test-split/--test-cluster-frac."
+            )
+        heldout_clusters = np.array([], dtype=np.int64)
+    else:
+        if args.test_cluster_frac > 0.0 and cache.cluster_ids is None:
+            raise ValueError(
+                "--test-cluster-frac requires cache metadata 'cluster_ids'. "
+                "Rebuild cache from train_mock_galaxy.py with cluster_ID present, "
+                "or pass --exclude-indices."
+            )
+        _, test_rows, heldout_clusters = _compute_test_split_with_cluster_holdout(
+            n_total=cache.values_norm.shape[0],
+            test_split=args.test_split,
+            cluster_ids=cache.cluster_ids,
+            test_cluster_frac=args.test_cluster_frac,
+            random_state=args.seed,
+        )
+        if len(test_rows) > 0:
+            generated_test_idx_path = os.path.join(args.output_dir, "test_indices.npy")
+            np.save(generated_test_idx_path, test_rows.astype(np.int64))
+            print(f"Saved generated test indices: {generated_test_idx_path} ({len(test_rows):,} rows)")
+        if len(heldout_clusters) > 0:
+            generated_test_cluster_ids_path = os.path.join(args.output_dir, "test_cluster_ids.npy")
+            np.save(generated_test_cluster_ids_path, heldout_clusters.astype(np.int64))
+            n_cluster_rows = int(np.isin(cache.cluster_ids, heldout_clusters).sum())
+            print(
+                "Cluster holdout: "
+                f"{len(heldout_clusters)} clusters, {n_cluster_rows:,} rows "
+                f"(saved to {generated_test_cluster_ids_path})"
+            )
+        exclude_idx = test_rows if len(test_rows) > 0 else None
     train_rows, val_rows = build_row_split(
         n_rows=cache.values_norm.shape[0],
         exclude_indices=exclude_idx,
@@ -1385,6 +1542,9 @@ def main() -> None:
         "num_parameters": n_params,
         "train_rows": int(len(train_ds)),
         "val_rows": int(len(val_ds)),
+        "generated_test_indices_path": generated_test_idx_path,
+        "generated_test_cluster_ids_path": generated_test_cluster_ids_path,
+        "heldout_cluster_ids": heldout_clusters.astype(np.int64).tolist(),
         "checkpoint_path": ckpt_path,
         "resume_checkpoint_path": resume_ckpt_path,
         "resumed_from": args.resume_from,

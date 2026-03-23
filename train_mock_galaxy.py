@@ -31,18 +31,32 @@ import pandas as pd
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from columns import (
-    INTRINSIC_COLS, TRUE_MAG_COLS, OBS_COLS, OBS_ERR_COLS,
-    ALL_VALUE_COLS, NUM_NODES, N_INTRINSIC, N_TRUE_MAG,
-)
-from prepare_data import galactic_to_unitvec
-from transformer import Simformer
-from simflower import FlowMatchingTrainer
-from utils import make_condition_mask_generator
-from value_transforms import (
-    apply_forward_value_transforms_numpy,
-    default_value_transform_metadata,
-)
+try:
+    from .columns import (
+        INTRINSIC_COLS, TRUE_MAG_COLS, OBS_COLS, OBS_ERR_COLS,
+        ALL_VALUE_COLS, NUM_NODES, N_INTRINSIC, N_TRUE_MAG,
+    )
+    from .prepare_data import galactic_to_unitvec
+    from .transformer import Simformer
+    from .simflower import FlowMatchingTrainer
+    from .utils import make_condition_mask_generator
+    from .value_transforms import (
+        apply_forward_value_transforms_numpy,
+        default_value_transform_metadata,
+    )
+except ImportError:
+    from columns import (
+        INTRINSIC_COLS, TRUE_MAG_COLS, OBS_COLS, OBS_ERR_COLS,
+        ALL_VALUE_COLS, NUM_NODES, N_INTRINSIC, N_TRUE_MAG,
+    )
+    from prepare_data import galactic_to_unitvec
+    from transformer import Simformer
+    from simflower import FlowMatchingTrainer
+    from utils import make_condition_mask_generator
+    from value_transforms import (
+        apply_forward_value_transforms_numpy,
+        default_value_transform_metadata,
+    )
 
 
 # Observed errors that are non-finite or <=0 are floored so they still enter

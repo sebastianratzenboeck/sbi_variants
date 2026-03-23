@@ -41,12 +41,20 @@ from sbi_variants.posterior_models import (
     ConditionalFlowPosterior,
 )
 from sbi_variants.value_transforms import apply_inverse_value_transforms_numpy
-from train_mock_galaxy import (
-    DEFAULT_CLUSTER_ID_COL,
-    build_arrays as build_cache_arrays,
-    load_data as load_raw_data,
-    save_arrays as save_cache_arrays,
-)
+try:
+    from .train_mock_galaxy import (
+        DEFAULT_CLUSTER_ID_COL,
+        build_arrays as build_cache_arrays,
+        load_data as load_raw_data,
+        save_arrays as save_cache_arrays,
+    )
+except ImportError:
+    from train_mock_galaxy import (
+        DEFAULT_CLUSTER_ID_COL,
+        build_arrays as build_cache_arrays,
+        load_data as load_raw_data,
+        save_arrays as save_cache_arrays,
+    )
 
 _BIN_SAMPLER_CHUNK_SIZE = 1_000_000
 _REQUIRED_POSITIVE_TRANSFORMS = {

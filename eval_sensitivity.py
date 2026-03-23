@@ -12,19 +12,34 @@ import numpy as np
 import pandas as pd
 import torch
 
-from columns import OBS_COLS, N_INTRINSIC, N_TRUE_MAG
-from sample_mock_galaxy import load_model, sample_posterior
-from eval_utils import (
-    DEFAULT_TARGET_COLS,
-    LOG_ERR_UNOBS,
-    auto_device,
-    column_indices,
-    ensure_dir,
-    load_cache_arrays,
-    parse_float_list,
-    parse_str_list,
-    to_input_tensors,
-)
+try:
+    from .columns import OBS_COLS, N_INTRINSIC, N_TRUE_MAG
+    from .sample_mock_galaxy import load_model, sample_posterior
+    from .eval_utils import (
+        DEFAULT_TARGET_COLS,
+        LOG_ERR_UNOBS,
+        auto_device,
+        column_indices,
+        ensure_dir,
+        load_cache_arrays,
+        parse_float_list,
+        parse_str_list,
+        to_input_tensors,
+    )
+except ImportError:
+    from columns import OBS_COLS, N_INTRINSIC, N_TRUE_MAG
+    from sample_mock_galaxy import load_model, sample_posterior
+    from eval_utils import (
+        DEFAULT_TARGET_COLS,
+        LOG_ERR_UNOBS,
+        auto_device,
+        column_indices,
+        ensure_dir,
+        load_cache_arrays,
+        parse_float_list,
+        parse_str_list,
+        to_input_tensors,
+    )
 
 
 def parse_args():

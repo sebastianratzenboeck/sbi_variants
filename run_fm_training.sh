@@ -21,20 +21,28 @@
 # ---------------------------------------------------------------------------
 
 module purge
-module load python
-mamba activate py_gpu_cuda12.4
+module load "${PYTHON_MODULE:-python}"
+mamba activate "${CONDA_ENV:-py_gpu_cuda12.4}"
 
-DATA_PATH="/n/holystore01/LABS/itc_lab/Lab/to-Sebastian/mock_galaxy/galaxy_field_clusters-subset_processed_clusterID.parquet"
-OUTPUT_DIR="/n/holystore01/LABS/itc_lab/Lab/to-Sebastian/fm_sbi_colors"
-CACHE_PATH="${OUTPUT_DIR}/build_arrays_cache.npz"
-RUN_NAME="fm_colors_tau-0_beta-025_epochSize5M_noDropout_maxEpochs5M"
-CONFIG_PATH="configs/train_fm_baseline.json"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="${REPO_DIR:-${SCRIPT_DIR}}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+
+DATA_PATH="${DATA_PATH:-}"
+OUTPUT_DIR="${OUTPUT_DIR:-${REPO_DIR}/output_fm}"
+CACHE_PATH="${CACHE_PATH:-${OUTPUT_DIR}/build_arrays_cache.npz}"
+RUN_NAME="${RUN_NAME:-fm_colors_tau-0_beta-025_epochSize5M_noDropout_maxEpochs5M}"
+CONFIG_PATH="${CONFIG_PATH:-${REPO_DIR}/configs/train_fm_baseline.json}"
+DEVICE="${DEVICE:-cuda}"
+WANDB_PROJECT="${WANDB_PROJECT:-mock-galaxy-simformer}"
+TEST_SPLIT="${TEST_SPLIT:-0.05}"
+TEST_CLUSTER_FRAC="${TEST_CLUSTER_FRAC:-0.2}"
 
 # Total target epochs (not additional epochs)
-EPOCHS_TOTAL=0
+EPOCHS_TOTAL="${EPOCHS_TOTAL:-300}"
 
 mkdir -p "${OUTPUT_DIR}"
-cd "$HOME/code/sbi_variants"
+cd "${REPO_DIR}"
 
 RESUME_CKPT="${OUTPUT_DIR}/resume_checkpoint_${RUN_NAME}.pt"
 
@@ -52,19 +60,28 @@ else
   echo "No resume checkpoint found; starting fresh."
 fi
 
-python train_variant_sbi_fm.py \
+if [[ ! -f "${CACHE_PATH}" && -z "${DATA_PATH}" ]]; then
+  echo "ERROR: cache not found at ${CACHE_PATH} and DATA_PATH is empty."
+  echo "Set DATA_PATH so the cache can be built, or point CACHE_PATH to an existing cache."
+  exit 1
+fi
+
+if [[ -n "${DATA_PATH}" ]]; then
+  EXTRA_ARGS+=(--data-path "${DATA_PATH}")
+fi
+
+"${PYTHON_BIN}" train_variant_sbi_fm.py \
   --config "${CONFIG_PATH}" \
-  --data-path "${DATA_PATH}" \
   --cache-path "${CACHE_PATH}" \
   --output-dir "${OUTPUT_DIR}" \
   --run-name "${RUN_NAME}" \
   --epochs "${EPOCHS_TOTAL}" \
-  --test-split 0.05 \
-  --test-cluster-frac 0.2 \
+  --test-split "${TEST_SPLIT}" \
+  --test-cluster-frac "${TEST_CLUSTER_FRAC}" \
   --cluster-id-col cluster_ID \
   --wandb \
-  --wandb-project mock-galaxy-simformer \
-  --device cuda \
+  --wandb-project "${WANDB_PROJECT}" \
+  --device "${DEVICE}" \
   "${EXTRA_ARGS[@]}"
 
 # Required files for evaluation

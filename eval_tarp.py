@@ -12,21 +12,38 @@ import numpy as np
 import pandas as pd
 import torch
 
-from sample_mock_galaxy import load_model, sample_posterior
-from eval_utils import (
-    DEFAULT_TARGET_COLS,
-    auto_device,
-    central_rank_coverage,
-    column_indices,
-    ensure_dir,
-    ks_uniform,
-    load_cache_arrays,
-    maybe_denormalize,
-    parse_float_list,
-    parse_str_list,
-    projection_ranks,
-    to_input_tensors,
-)
+try:
+    from .sample_mock_galaxy import load_model, sample_posterior
+    from .eval_utils import (
+        DEFAULT_TARGET_COLS,
+        auto_device,
+        central_rank_coverage,
+        column_indices,
+        ensure_dir,
+        ks_uniform,
+        load_cache_arrays,
+        maybe_denormalize,
+        parse_float_list,
+        parse_str_list,
+        projection_ranks,
+        to_input_tensors,
+    )
+except ImportError:
+    from sample_mock_galaxy import load_model, sample_posterior
+    from eval_utils import (
+        DEFAULT_TARGET_COLS,
+        auto_device,
+        central_rank_coverage,
+        column_indices,
+        ensure_dir,
+        ks_uniform,
+        load_cache_arrays,
+        maybe_denormalize,
+        parse_float_list,
+        parse_str_list,
+        projection_ranks,
+        to_input_tensors,
+    )
 
 
 def parse_args():

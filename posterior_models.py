@@ -6,7 +6,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformer import TimeEmbed
+try:
+    from .transformer import TimeEmbed
+except ImportError:
+    from transformer import TimeEmbed
 
 
 class LossResult(NamedTuple):

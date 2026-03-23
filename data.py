@@ -8,8 +8,12 @@ import torch
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 
-from columns import OBS_COLS, COLOR_DEFINITIONS
-from value_transforms import apply_inverse_value_transforms_numpy
+try:
+    from .columns import OBS_COLS, COLOR_DEFINITIONS
+    from .value_transforms import apply_inverse_value_transforms_numpy
+except ImportError:
+    from columns import OBS_COLS, COLOR_DEFINITIONS
+    from value_transforms import apply_inverse_value_transforms_numpy
 
 
 DEFAULT_THETA_COLS = ["feh", "m_init", "logAge", "rad", "logL", "logT", "logg", "Av"]

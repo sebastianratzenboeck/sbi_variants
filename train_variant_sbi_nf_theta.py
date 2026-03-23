@@ -3,7 +3,10 @@
 import sys
 from pathlib import Path
 
-from train_sbi_posterior import main as train_main
+try:
+    from .train_sbi_posterior import main as train_main
+except ImportError:
+    from train_sbi_posterior import main as train_main
 
 
 if __name__ == "__main__":

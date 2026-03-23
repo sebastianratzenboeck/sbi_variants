@@ -3,7 +3,10 @@
 import sys
 from pathlib import Path
 
-from train_sbi_nre import main as train_main
+try:
+    from .train_sbi_nre import main as train_main
+except ImportError:
+    from train_sbi_nre import main as train_main
 
 
 if __name__ == "__main__":
@@ -15,4 +18,3 @@ if __name__ == "__main__":
 
     sys.argv = [sys.argv[0], *args]
     train_main()
-

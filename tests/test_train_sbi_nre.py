@@ -1,10 +1,11 @@
 import unittest
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from train_sbi_nre import _run_epoch
+from train_sbi_nre import _compute_test_split_with_cluster_holdout, _run_epoch
 
 
 class _DictDataset(Dataset):
@@ -75,6 +76,36 @@ class TestTrainSbiNreWeighting(unittest.TestCase):
         expected = (bce_all * row_w_pair).sum() / row_w_pair.sum()
 
         self.assertAlmostEqual(stats["bce_weighted"], float(expected.item()), places=6)
+
+
+class TestTrainSbiNreSplits(unittest.TestCase):
+    def test_cluster_holdout_excludes_whole_clusters_from_trainval(self):
+        cluster_ids = np.array([-1, -1, 1, 1, 2, 2, 3, 3, 4, 4], dtype=np.int64)
+        trainval_idx, test_idx, heldout = _compute_test_split_with_cluster_holdout(
+            n_total=len(cluster_ids),
+            test_split=0.2,
+            cluster_ids=cluster_ids,
+            test_cluster_frac=0.5,
+            random_state=7,
+        )
+
+        self.assertGreaterEqual(len(heldout), 1)
+        heldout_mask = np.isin(cluster_ids, heldout)
+        self.assertFalse(np.any(heldout_mask[trainval_idx]))
+        self.assertTrue(np.all(np.isin(np.where(heldout_mask)[0], test_idx)))
+
+    def test_zero_test_split_returns_all_rows_when_no_cluster_holdout(self):
+        trainval_idx, test_idx, heldout = _compute_test_split_with_cluster_holdout(
+            n_total=8,
+            test_split=0.0,
+            cluster_ids=None,
+            test_cluster_frac=0.0,
+            random_state=11,
+        )
+
+        np.testing.assert_array_equal(trainval_idx, np.arange(8, dtype=np.int64))
+        self.assertEqual(len(test_idx), 0)
+        self.assertEqual(len(heldout), 0)
 
 
 if __name__ == "__main__":

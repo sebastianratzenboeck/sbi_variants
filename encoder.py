@@ -3,14 +3,24 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from columns import OBS_COLS
-from sampling import build_inference_edge_mask
-from transformer import (
-    MissingnessContextEncoder,
-    Simformer,
-    Tokenizer,
-    TransformerBlock,
-)
+try:
+    from .columns import OBS_COLS
+    from .sampling import build_inference_edge_mask
+    from .transformer import (
+        MissingnessContextEncoder,
+        Simformer,
+        Tokenizer,
+        TransformerBlock,
+    )
+except ImportError:
+    from columns import OBS_COLS
+    from sampling import build_inference_edge_mask
+    from transformer import (
+        MissingnessContextEncoder,
+        Simformer,
+        Tokenizer,
+        TransformerBlock,
+    )
 
 
 def _build_default_survey_obs_groups(columns: list[str]) -> list[list[int]]:

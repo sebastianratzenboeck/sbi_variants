@@ -33,20 +33,36 @@ import numpy as np
 import pandas as pd
 import torch
 
-from columns import (
-    INTRINSIC_COLS, OBS_COLS, OBS_ERR_COLS, ALL_VALUE_COLS, COLOR_DEFINITIONS,
-)
-from prepare_data import galactic_to_unitvec
-from transformer import Simformer
-from inference_utils import NormStats
-from encoder import ObservationEncoder
-from posterior_models import ConditionalFMPosterior, ConditionalFlowPosterior
-from sampling import (
-    build_inference_edge_mask,
-    build_inference_condition_mask,
-    build_inference_node_ids,
-    sample_batched_flow,
-)
+try:
+    from .columns import (
+        INTRINSIC_COLS, OBS_COLS, OBS_ERR_COLS, ALL_VALUE_COLS, COLOR_DEFINITIONS,
+    )
+    from .prepare_data import galactic_to_unitvec
+    from .transformer import Simformer
+    from .inference_utils import NormStats
+    from .encoder import ObservationEncoder
+    from .posterior_models import ConditionalFMPosterior, ConditionalFlowPosterior
+    from .sampling import (
+        build_inference_edge_mask,
+        build_inference_condition_mask,
+        build_inference_node_ids,
+        sample_batched_flow,
+    )
+except ImportError:
+    from columns import (
+        INTRINSIC_COLS, OBS_COLS, OBS_ERR_COLS, ALL_VALUE_COLS, COLOR_DEFINITIONS,
+    )
+    from prepare_data import galactic_to_unitvec
+    from transformer import Simformer
+    from inference_utils import NormStats
+    from encoder import ObservationEncoder
+    from posterior_models import ConditionalFMPosterior, ConditionalFlowPosterior
+    from sampling import (
+        build_inference_edge_mask,
+        build_inference_condition_mask,
+        build_inference_node_ids,
+        sample_batched_flow,
+    )
 
 # Keep observed errors strictly positive so they are always treated as real
 # measurements by log-error normalization.

@@ -20,7 +20,10 @@ import argparse
 import numpy as np
 import pandas as pd
 
-from columns import SURVEY_ERRORS
+try:
+    from .columns import SURVEY_ERRORS
+except ImportError:
+    from columns import SURVEY_ERRORS
 
 
 def galactic_to_unitvec(glon_deg, glat_deg):
