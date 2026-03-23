@@ -34,7 +34,7 @@ import pandas as pd
 import torch
 
 from columns import (
-    INTRINSIC_COLS, OBS_COLS, OBS_ERR_COLS, ALL_VALUE_COLS,
+    INTRINSIC_COLS, OBS_COLS, OBS_ERR_COLS, ALL_VALUE_COLS, COLOR_DEFINITIONS,
 )
 from prepare_data import galactic_to_unitvec
 from transformer import Simformer
@@ -51,6 +51,8 @@ from sampling import (
 # Keep observed errors strictly positive so they are always treated as real
 # measurements by log-error normalization.
 OBS_ERROR_FLOOR = 1e-6
+LOG_ERR_UNOBS = 5.0
+_COLOR_BY_NAME = {name: (mag1, mag2) for (name, mag1, mag2) in COLOR_DEFINITIONS}
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +189,7 @@ def load_model(model_dir, run_name="default", device="cpu"):
         _upgrade_legacy_binary_state_embeddings(state_dict)
         model.load_state_dict(state_dict)
         norm_stats = NormStats(os.path.join(model_dir, "norm_stats.npz"))
+        model._sbi_artifact_kind = "legacy_simformer"
     elif os.path.exists(posterior_cfg_path):
         with open(posterior_cfg_path) as f:
             config = json.load(f)
@@ -215,8 +218,16 @@ def load_model(model_dir, run_name="default", device="cpu"):
                 "(input_columns or input_columns_with_colors)."
             )
         model = _build_posterior_model_from_config(config, input_columns=input_columns)
+        theta_columns = [str(c) for c in config["theta_columns"]]
         state_dict = _load_state_dict(ckpt_path, device=device)
         model.load_state_dict(state_dict)
+        model._sbi_artifact_kind = "direct_posterior"
+        model._sbi_input_columns = [str(c) for c in input_columns]
+        model._sbi_theta_columns = theta_columns
+        model._sbi_theta_indices = [norm_stats.column_index(c) for c in theta_columns]
+        model._sbi_full_columns = [str(c) for c in norm_stats.columns]
+        model._sbi_full_dim = len(norm_stats.columns)
+        model._sbi_norm_stats = norm_stats
     else:
         raise FileNotFoundError(
             f"Could not find model config for run '{run_name}' in {model_dir}. "
@@ -421,6 +432,197 @@ def prepare_observations_from_cache(
 # Posterior sampling
 # ---------------------------------------------------------------------------
 
+def _is_direct_posterior_model(model) -> bool:
+    return (
+        isinstance(model, (ConditionalFMPosterior, ConditionalFlowPosterior))
+        or getattr(model, "_sbi_artifact_kind", None) == "direct_posterior"
+    )
+
+
+def _compute_color_feature(
+    *,
+    color_name,
+    full_values,
+    full_errors,
+    full_observed,
+    full_columns,
+    norm_stats,
+):
+    if color_name not in _COLOR_BY_NAME:
+        raise ValueError(f"Unknown color feature '{color_name}'.")
+    if color_name not in norm_stats.color_names:
+        raise ValueError(
+            f"Color feature '{color_name}' is missing from normalization metadata."
+        )
+
+    mag1, mag2 = _COLOR_BY_NAME[color_name]
+    full_to_idx = {str(c): i for i, c in enumerate(full_columns)}
+    if mag1 not in full_to_idx or mag2 not in full_to_idx:
+        raise ValueError(
+            f"Cannot derive color '{color_name}' because '{mag1}' or '{mag2}' "
+            "is missing from the full column layout."
+        )
+
+    idx1 = full_to_idx[mag1]
+    idx2 = full_to_idx[mag2]
+    col_idx = [norm_stats.column_index(mag1), norm_stats.column_index(mag2)]
+
+    mags_norm = torch.stack([full_values[:, idx1], full_values[:, idx2]], dim=1)
+    mags_raw = norm_stats.denormalize(mags_norm, column_indices=col_idx)
+    color_raw = mags_raw[:, 0] - mags_raw[:, 1]
+
+    color_meta_idx = norm_stats.color_names.index(color_name)
+    color_mean = torch.as_tensor(
+        float(norm_stats.color_means[color_meta_idx]),
+        dtype=full_values.dtype,
+        device=full_values.device,
+    )
+    color_std = torch.as_tensor(
+        max(float(norm_stats.color_stds[color_meta_idx]), 1e-8),
+        dtype=full_values.dtype,
+        device=full_values.device,
+    )
+    color_values = (color_raw - color_mean) / color_std
+
+    color_observed = (full_observed[:, idx1] * full_observed[:, idx2]).to(full_values.dtype)
+    color_values = torch.where(
+        color_observed > 0.5,
+        color_values,
+        torch.zeros_like(color_values),
+    )
+
+    color_errors = torch.full_like(color_values, LOG_ERR_UNOBS)
+    valid = color_observed > 0.5
+    if valid.any():
+        log_err_std = max(float(norm_stats.log_err_std), 1e-8)
+        e1_raw = torch.exp(full_errors[valid, idx1] * log_err_std + float(norm_stats.log_err_mean))
+        e2_raw = torch.exp(full_errors[valid, idx2] * log_err_std + float(norm_stats.log_err_mean))
+        color_err_raw = torch.sqrt(e1_raw.pow(2) + e2_raw.pow(2)).clamp_min(1e-10)
+        color_errors[valid] = (
+            torch.log(color_err_raw) - float(norm_stats.log_err_mean)
+        ) / log_err_std
+
+    return color_values, color_errors, color_observed
+
+
+def _build_direct_posterior_inputs(
+    *,
+    model,
+    condition_values,
+    observed_mask,
+    errors,
+):
+    input_columns = list(getattr(model, "_sbi_input_columns", []))
+    full_columns = list(getattr(model, "_sbi_full_columns", []))
+    norm_stats = getattr(model, "_sbi_norm_stats", None)
+    if not input_columns or not full_columns or norm_stats is None:
+        raise ValueError(
+            "Direct posterior checkpoint is missing input metadata required for inference."
+        )
+    if condition_values.shape[1] != len(full_columns):
+        raise ValueError(
+            "Full inference tensors do not match checkpoint column layout: "
+            f"got width={condition_values.shape[1]}, expected {len(full_columns)}."
+        )
+
+    full_to_idx = {str(c): i for i, c in enumerate(full_columns)}
+    vals = []
+    errs = []
+    obs = []
+    for col in input_columns:
+        if col in full_to_idx:
+            idx = full_to_idx[col]
+            vals.append(condition_values[:, idx])
+            errs.append(errors[:, idx])
+            obs.append(observed_mask[:, idx])
+            continue
+
+        color_values, color_errors, color_observed = _compute_color_feature(
+            color_name=col,
+            full_values=condition_values,
+            full_errors=errors,
+            full_observed=observed_mask,
+            full_columns=full_columns,
+            norm_stats=norm_stats,
+        )
+        vals.append(color_values)
+        errs.append(color_errors)
+        obs.append(color_observed)
+
+    return (
+        torch.stack(vals, dim=1),
+        torch.stack(errs, dim=1),
+        torch.stack(obs, dim=1),
+    )
+
+
+def _sample_direct_posterior(
+    *,
+    model,
+    condition_values,
+    observed_mask,
+    errors,
+    num_samples,
+    batch_size,
+    steps,
+    device,
+):
+    theta_indices = list(getattr(model, "_sbi_theta_indices", []))
+    full_dim = int(getattr(model, "_sbi_full_dim", condition_values.shape[1]))
+    if not theta_indices:
+        raise ValueError("Direct posterior checkpoint is missing theta index metadata.")
+    if condition_values.shape[1] != full_dim:
+        raise ValueError(
+            f"condition_values width={condition_values.shape[1]} does not match "
+            f"checkpoint full_dim={full_dim}."
+        )
+
+    input_values, input_errors, input_observed = _build_direct_posterior_inputs(
+        model=model,
+        condition_values=condition_values,
+        observed_mask=observed_mask,
+        errors=errors,
+    )
+
+    n_stars = int(condition_values.shape[0])
+    all_samples = (
+        condition_values.detach().cpu().unsqueeze(1).repeat(1, num_samples, 1)
+    )
+
+    for start in range(0, n_stars, batch_size):
+        end = min(start + batch_size, n_stars)
+        print(
+            f"  Sampling stars {start + 1}-{end}/{n_stars} "
+            f"({num_samples} draws each)..."
+        )
+        vals = input_values[start:end].to(device)
+        errs = input_errors[start:end].to(device)
+        obs = input_observed[start:end].to(device)
+
+        if isinstance(model, ConditionalFMPosterior):
+            theta_samples = model.sample(
+                values=vals,
+                errors=errs,
+                observed_mask=obs,
+                num_samples=num_samples,
+                steps=steps,
+            )
+        elif isinstance(model, ConditionalFlowPosterior):
+            theta_samples = model.sample(
+                values=vals,
+                errors=errs,
+                observed_mask=obs,
+                num_samples=num_samples,
+            )
+        else:
+            raise TypeError(
+                f"Unsupported direct posterior model type '{type(model).__name__}'."
+            )
+
+        all_samples[start:end, :, theta_indices] = theta_samples.detach().cpu()
+
+    return all_samples
+
 def sample_posterior(
     model,
     condition_values,
@@ -451,6 +653,21 @@ def sample_posterior(
     Returns:
         all_samples: (N_stars, num_samples, NUM_NODES) tensor in normalized space.
     """
+    if _is_direct_posterior_model(model):
+        # Direct posterior checkpoints sample theta only; embed those draws back
+        # into the full cached column layout so existing eval code can index by
+        # column name without special-casing model families.
+        return _sample_direct_posterior(
+            model=model,
+            condition_values=condition_values,
+            observed_mask=observed_mask,
+            errors=errors,
+            num_samples=num_samples,
+            batch_size=batch_size,
+            steps=steps,
+            device=device,
+        )
+
     N_stars = condition_values.shape[0]
     M = condition_values.shape[1]
     all_samples = torch.zeros(N_stars, num_samples, M, device="cpu")

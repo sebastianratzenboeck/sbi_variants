@@ -891,10 +891,16 @@ def _run_epoch(
                 # curriculum sampling correction (or are all ones by default).
                 row_w = batch.get("sample_weight")
                 if row_w is None:
-                    row_w_pair = torch.ones_like(bce_all)
+                    row_w_pos = torch.ones_like(bce_pos)
+                    row_w_neg = torch.ones_like(bce_neg)
                 else:
                     row_w = row_w.to(bce_all.dtype).reshape(-1)
-                    row_w_pair = torch.cat([row_w, row_w], dim=0)
+                    row_w_pos = row_w
+                    # Negative pairs draw x_i and theta_j from two sampled rows,
+                    # so p/q correction must account for both marginals.
+                    row_w_neg = row_w * row_w[perm]
+
+                row_w_pair = torch.cat([row_w_pos, row_w_neg], dim=0)
 
                 w_all = row_w_pair * w_pair
                 w_all = w_all / w_all.mean().clamp_min(1e-8)
@@ -903,7 +909,9 @@ def _run_epoch(
 
                 p_pos = torch.sigmoid(logits_pos)
                 p_neg = torch.sigmoid(logits_neg)
-                balance_value = (p_pos.mean() + p_neg.mean() - 1.0)
+                balance_pos = (p_pos * row_w_pos).sum() / row_w_pos.sum().clamp_min(1e-8)
+                balance_neg = (p_neg * row_w_neg).sum() / row_w_neg.sum().clamp_min(1e-8)
+                balance_value = (balance_pos + balance_neg - 1.0)
                 balance_pen = balance_value.pow(2)
 
                 if use_balanced_loss:
