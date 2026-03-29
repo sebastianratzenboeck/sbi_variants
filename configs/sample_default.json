@@ -1,8 +1,8 @@
 {
-  "model_dir": "/path/to/output_sbi_variants",
-  "run_name": "sbi_fm_v1",
-  "cache_path": "/path/to/build_arrays_cache.npz",
-  "index_file": "/path/to/test_indices.npy",
+  "model_dir": "/n/holystore01/LABS/itc_lab/Lab/to-Sebastian/nf_sbi_colors",
+  "run_name": "nf_zuko_colors_beta_tau-0_beta-025_epochSize5M_noDropout_maxEpochs5M",
+  "cache_path": "/n/holystore01/LABS/itc_lab/Lab/to-Sebastian/nf_sbi_colors/build_arrays_cache.npz",
+  "index_file": "/n/holystore01/LABS/itc_lab/Lab/to-Sebastian/nf_sbi_colors/test_indices.npy",
   "obs_file": null,
   "id_column": null,
   "max_stars": 1024,
@@ -12,6 +12,6 @@
   "steps": 128,
   "batch_size": 256,
   "device": "cuda",
-  "output_prefix": "/path/to/output_sbi_variants/posterior_sbi_fm_v1",
+  "output_prefix": "/n/holystore01/LABS/itc_lab/Lab/to-Sebastian/nf_sbi_colors/posterior_nf_zuko_colors_beta_tau-0_beta-025_epochSize5M_noDropout_maxEpochs5M",
   "denormalize": true
 }

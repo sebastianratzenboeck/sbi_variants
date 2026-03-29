@@ -41,6 +41,14 @@ def parse_args() -> argparse.Namespace:
                    help="Write compressed NPZ (smaller, slower)")
     p.add_argument("--sort-indices", action="store_true", default=False,
                    help="Sort index array before extraction (optional)")
+    p.add_argument("--max-rows", type=int, default=None,
+                   help="Optional cap on the number of rows copied into the output cache")
+    p.add_argument("--sample-mode", choices=("head", "random"), default="head",
+                   help="How to choose rows when --max-rows is set")
+    p.add_argument("--seed", type=int, default=42,
+                   help="Random seed used when --sample-mode=random")
+    p.add_argument("--output-index-file", type=str, default=None,
+                   help="Optional path for a local index file referencing the output cache rows")
     return p.parse_args()
 
 
@@ -65,6 +73,12 @@ def main() -> None:
         raise ValueError("Index file is empty.")
     if args.sort_indices:
         idx = np.sort(idx)
+    if args.max_rows is not None and args.max_rows > 0 and idx.size > args.max_rows:
+        if args.sample_mode == "head":
+            idx = idx[:args.max_rows]
+        else:
+            rng = np.random.default_rng(args.seed)
+            idx = np.sort(rng.choice(idx, size=args.max_rows, replace=False).astype(np.int64))
     print(f"  indices: {idx.size:,}")
     print(f"  min/max: {idx.min()} / {idx.max()}")
 
@@ -106,6 +120,11 @@ def main() -> None:
     print(f"  output: {output_path}")
     print(f"  compressed: {args.compress}")
     saver(output_path, **out)
+
+    if args.output_index_file is not None:
+        local_idx = np.arange(idx.size, dtype=np.int64)
+        np.save(args.output_index_file, local_idx)
+        print(f"  wrote local index file: {args.output_index_file}")
 
     # Light verification
     print("\n--- Verifying output ---")
