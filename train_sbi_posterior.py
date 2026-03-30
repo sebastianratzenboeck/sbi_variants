@@ -219,6 +219,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--exclude-indices", type=str, default=None,
                    help="Optional .npy indices excluded from train/val (e.g. test_indices.npy).")
     p.add_argument(
+        "--train-indices",
+        type=str,
+        default=None,
+        help=(
+            "Optional .npy indices used as the exact training rows. "
+            "When set together with --val-indices, internal train/val splitting is bypassed."
+        ),
+    )
+    p.add_argument(
+        "--val-indices",
+        type=str,
+        default=None,
+        help=(
+            "Optional .npy indices used as the exact validation rows. "
+            "When set together with --train-indices, internal train/val splitting is bypassed."
+        ),
+    )
+    p.add_argument(
         "--cluster-id-col",
         type=str,
         default=DEFAULT_CLUSTER_ID_COL,
@@ -461,6 +479,14 @@ def parse_args() -> argparse.Namespace:
         norm = args.exclude_indices.strip().lower()
         if norm in ("", "none", "null"):
             args.exclude_indices = None
+    if isinstance(args.train_indices, str):
+        norm = args.train_indices.strip().lower()
+        if norm in ("", "none", "null"):
+            args.train_indices = None
+    if isinstance(args.val_indices, str):
+        norm = args.val_indices.strip().lower()
+        if norm in ("", "none", "null"):
+            args.val_indices = None
 
     missing = []
     if not args.output_dir:
@@ -499,6 +525,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"--test-split must be in [0,1), got {args.test_split}")
     if not (0.0 <= args.test_cluster_frac <= 1.0):
         parser.error(f"--test-cluster-frac must be in [0,1], got {args.test_cluster_frac}")
+    if (args.train_indices is None) ^ (args.val_indices is None):
+        parser.error("--train-indices and --val-indices must be provided together")
     if args.importance_weight_min <= 0:
         parser.error(
             f"--importance-weight-min must be > 0, got {args.importance_weight_min}"
@@ -1230,49 +1258,78 @@ def main() -> None:
 
     generated_test_idx_path = None
     generated_test_cluster_ids_path = None
-    if args.exclude_indices is not None:
-        exclude_idx = load_indices(args.exclude_indices)
+    explicit_split = (args.train_indices is not None and args.val_indices is not None)
+    exclude_idx = None
+    if explicit_split:
+        if args.exclude_indices is not None:
+            print("WARNING: --train-indices/--val-indices provided; ignoring --exclude-indices.")
         if args.test_split > 0.0 or args.test_cluster_frac > 0.0:
             print(
-                "WARNING: --exclude-indices is set; ignoring --test-split/--test-cluster-frac."
+                "WARNING: --train-indices/--val-indices provided; ignoring --test-split/--test-cluster-frac."
             )
-    else:
-        if args.test_cluster_frac > 0.0 and cache.cluster_ids is None:
+        train_rows = load_indices(args.train_indices)
+        val_rows = load_indices(args.val_indices)
+        if train_rows is None or val_rows is None:
+            raise ValueError("Explicit train/val index files could not be loaded.")
+        train_rows = np.asarray(train_rows, dtype=np.int64)
+        val_rows = np.asarray(val_rows, dtype=np.int64)
+        if train_rows.size == 0 or val_rows.size == 0:
+            raise ValueError("Explicit train/val index files must be non-empty.")
+        overlap = np.intersect1d(train_rows, val_rows)
+        if overlap.size > 0:
             raise ValueError(
-                "--test-cluster-frac requires cache metadata 'cluster_ids'. "
-                "Rebuild cache from train_mock_galaxy.py with cluster_ID present, "
-                "or pass --exclude-indices."
+                "Explicit train/val index files must be disjoint. "
+                f"Found {overlap.size} overlapping rows."
             )
-        _, test_rows, heldout_clusters = _compute_test_split_with_cluster_holdout(
-            n_total=cache.values_norm.shape[0],
-            test_split=args.test_split,
-            cluster_ids=cache.cluster_ids,
-            test_cluster_frac=args.test_cluster_frac,
-            random_state=args.seed,
-        )
-        if len(test_rows) > 0:
-            generated_test_idx_path = os.path.join(args.output_dir, "test_indices.npy")
-            np.save(generated_test_idx_path, test_rows.astype(np.int64))
-            print(f"Saved generated test indices: {generated_test_idx_path} ({len(test_rows):,} rows)")
-        if len(heldout_clusters) > 0:
-            generated_test_cluster_ids_path = os.path.join(args.output_dir, "test_cluster_ids.npy")
-            np.save(generated_test_cluster_ids_path, heldout_clusters.astype(np.int64))
-            n_cluster_rows = int(np.isin(cache.cluster_ids, heldout_clusters).sum())
-            print(
-                "Cluster holdout: "
-                f"{len(heldout_clusters)} clusters, {n_cluster_rows:,} rows "
-                f"(saved to {generated_test_cluster_ids_path})"
+        n_total_rows = int(cache.values_norm.shape[0])
+        if train_rows.min() < 0 or val_rows.min() < 0 or train_rows.max() >= n_total_rows or val_rows.max() >= n_total_rows:
+            raise ValueError("Explicit train/val indices contain out-of-range rows.")
+        print(f"Using explicit train indices: {args.train_indices} ({train_rows.size:,} rows)")
+        print(f"Using explicit val indices:   {args.val_indices} ({val_rows.size:,} rows)")
+    else:
+        if args.exclude_indices is not None:
+            exclude_idx = load_indices(args.exclude_indices)
+            if args.test_split > 0.0 or args.test_cluster_frac > 0.0:
+                print(
+                    "WARNING: --exclude-indices is set; ignoring --test-split/--test-cluster-frac."
+                )
+        else:
+            if args.test_cluster_frac > 0.0 and cache.cluster_ids is None:
+                raise ValueError(
+                    "--test-cluster-frac requires cache metadata 'cluster_ids'. "
+                    "Rebuild cache from train_mock_galaxy.py with cluster_ID present, "
+                    "or pass --exclude-indices."
+                )
+            _, test_rows, heldout_clusters = _compute_test_split_with_cluster_holdout(
+                n_total=cache.values_norm.shape[0],
+                test_split=args.test_split,
+                cluster_ids=cache.cluster_ids,
+                test_cluster_frac=args.test_cluster_frac,
+                random_state=args.seed,
             )
-        # Exclude all generated test rows from train/val.
-        exclude_idx = test_rows if len(test_rows) > 0 else None
+            if len(test_rows) > 0:
+                generated_test_idx_path = os.path.join(args.output_dir, "test_indices.npy")
+                np.save(generated_test_idx_path, test_rows.astype(np.int64))
+                print(f"Saved generated test indices: {generated_test_idx_path} ({len(test_rows):,} rows)")
+            if len(heldout_clusters) > 0:
+                generated_test_cluster_ids_path = os.path.join(args.output_dir, "test_cluster_ids.npy")
+                np.save(generated_test_cluster_ids_path, heldout_clusters.astype(np.int64))
+                n_cluster_rows = int(np.isin(cache.cluster_ids, heldout_clusters).sum())
+                print(
+                    "Cluster holdout: "
+                    f"{len(heldout_clusters)} clusters, {n_cluster_rows:,} rows "
+                    f"(saved to {generated_test_cluster_ids_path})"
+                )
+            # Exclude all generated test rows from train/val.
+            exclude_idx = test_rows if len(test_rows) > 0 else None
 
-    train_rows, val_rows = build_row_split(
-        n_rows=cache.values_norm.shape[0],
-        exclude_indices=exclude_idx,
-        val_split=args.val_split,
-        seed=args.seed,
-        max_rows=args.max_stars,
-    )
+        train_rows, val_rows = build_row_split(
+            n_rows=cache.values_norm.shape[0],
+            exclude_indices=exclude_idx,
+            val_split=args.val_split,
+            seed=args.seed,
+            max_rows=args.max_stars,
+        )
     arr_train = build_sbi_arrays(
         cache,
         row_indices=train_rows,
@@ -1813,6 +1870,8 @@ def main() -> None:
         "resolved_exclude_indices": args.exclude_indices if args.exclude_indices is not None else generated_test_idx_path,
         "generated_test_indices_path": generated_test_idx_path,
         "generated_test_cluster_ids_path": generated_test_cluster_ids_path,
+        "resolved_train_indices": args.train_indices,
+        "resolved_val_indices": args.val_indices,
         "best_val_loss": best_val,
         "best_epoch": best_epoch,
         "num_parameters": n_params,
