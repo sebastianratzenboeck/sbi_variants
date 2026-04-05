@@ -155,7 +155,7 @@ def _build_model_from_config(
         pooling_mode=str(config.get("pooling_mode", "mean")),
     )
     method = str(config.get("method", "flow_matching"))
-    if method in ("flow_matching", "flow_matching_xattn"):
+    if method == "flow_matching":
         return ConditionalFMPosterior(
             encoder=encoder,
             theta_dim=len(theta_columns),
