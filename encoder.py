@@ -66,12 +66,18 @@ class ObservationEncoder(nn.Module):
         dropout: float = 0.05,
         use_missingness_context: bool = True,
         missingness_context_hidden_dim: int = 64,
+        pooling_mode: str = "mean",
     ):
         super().__init__()
         self.input_columns = [str(c) for c in input_columns]
         self.num_nodes = len(self.input_columns)
         self.output_dim = int(attn_embed_dim)
         self.use_missingness_context = bool(use_missingness_context)
+        self.pooling_mode = str(pooling_mode).lower()
+        if self.pooling_mode not in {"mean", "attention"}:
+            raise ValueError(
+                f"Unsupported pooling_mode '{pooling_mode}'. Use one of: mean, attention."
+            )
 
         # Conditioning is intentionally disabled for this SBI variant.
         self.tokenizer = Tokenizer(
@@ -113,14 +119,18 @@ class ObservationEncoder(nn.Module):
                 for _ in range(num_layers)
             ]
         )
+        self.token_norm = nn.LayerNorm(attn_embed_dim)
         self.out_norm = nn.LayerNorm(attn_embed_dim)
+        self.pool_attn = (
+            nn.Linear(attn_embed_dim, 1) if self.pooling_mode == "attention" else None
+        )
 
-    def forward(
+    def forward_tokens(
         self,
         values: torch.Tensor,       # (B, N)
         errors: torch.Tensor,       # (B, N)
         observed_mask: torch.Tensor,  # (B, N)
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         B, N = values.shape
         if N != self.num_nodes:
             raise ValueError(
@@ -169,11 +179,43 @@ class ObservationEncoder(nn.Module):
         for block in self.blocks:
             tokens = block(tokens, edge_mask, context=None)
 
-        tokens_main = tokens[:, :N, :]
-        obs = (observed_mask > 0.5).to(tokens_main.dtype).unsqueeze(-1)
-        pooled = (tokens_main * obs).sum(dim=1) / obs.sum(dim=1).clamp_min(1.0)
+        token_mask = (observed_mask > 0.5)
+        token_seq = tokens[:, :N, :]
 
         if self.use_missingness_context and tokens.shape[1] == N + 1:
-            pooled = pooled + tokens[:, N, :]
+            context_token = tokens[:, N:N + 1, :]
+            token_seq = torch.cat([token_seq, context_token], dim=1)
+            context_valid = torch.ones(B, 1, device=token_mask.device, dtype=token_mask.dtype)
+            token_mask = torch.cat([token_mask, context_valid], dim=1)
 
+        token_seq = self.token_norm(token_seq)
+        return token_seq, token_mask
+
+    def _pool_tokens(
+        self,
+        token_seq: torch.Tensor,
+        token_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        valid = token_mask.to(token_seq.dtype).unsqueeze(-1)
+        if self.pooling_mode == "mean":
+            return (token_seq * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
+
+        if self.pooling_mode == "attention":
+            if self.pool_attn is None:
+                raise RuntimeError("attention pooling requested but pool_attn is missing")
+            logits = self.pool_attn(token_seq).squeeze(-1)
+            logits = logits.masked_fill(~token_mask, float("-inf"))
+            weights = torch.softmax(logits, dim=1).unsqueeze(-1)
+            return (token_seq * weights).sum(dim=1)
+
+        raise RuntimeError(f"Unsupported pooling_mode '{self.pooling_mode}'.")
+
+    def forward(
+        self,
+        values: torch.Tensor,       # (B, N)
+        errors: torch.Tensor,       # (B, N)
+        observed_mask: torch.Tensor,  # (B, N)
+    ) -> torch.Tensor:
+        token_seq, token_mask = self.forward_tokens(values, errors, observed_mask)
+        pooled = self._pool_tokens(token_seq, token_mask)
         return self.out_norm(pooled)

@@ -41,7 +41,11 @@ try:
     from .transformer import Simformer
     from .inference_utils import NormStats
     from .encoder import ObservationEncoder
-    from .posterior_models import ConditionalFMPosterior, ConditionalFlowPosterior
+    from .posterior_models import (
+        ConditionalFMPosterior,
+        ConditionalFlowPosterior,
+        CrossAttentionConditionalFMPosterior,
+    )
     from .sampling import (
         build_inference_edge_mask,
         build_inference_condition_mask,
@@ -56,7 +60,11 @@ except ImportError:
     from transformer import Simformer
     from inference_utils import NormStats
     from encoder import ObservationEncoder
-    from posterior_models import ConditionalFMPosterior, ConditionalFlowPosterior
+    from posterior_models import (
+        ConditionalFMPosterior,
+        ConditionalFlowPosterior,
+        CrossAttentionConditionalFMPosterior,
+    )
     from sampling import (
         build_inference_edge_mask,
         build_inference_condition_mask,
@@ -145,6 +153,7 @@ def _build_posterior_model_from_config(config, input_columns):
         dropout=float(config.get("dropout", 0.05)),
         use_missingness_context=bool(config.get("use_missingness_context", False)),
         missingness_context_hidden_dim=int(config.get("missingness_context_hidden_dim", 64)),
+        pooling_mode=str(config.get("pooling_mode", "mean")),
     )
     method = str(config.get("method", "flow_matching"))
     if method == "flow_matching":
@@ -156,6 +165,17 @@ def _build_posterior_model_from_config(config, input_columns):
             sigma_min=float(config.get("sigma_min", 1e-3)),
             time_prior_exponent=float(config.get("time_prior_exponent", 0.0)),
             dropout=float(config.get("dropout", 0.05)),
+        )
+    if method == "flow_matching_xattn":
+        return CrossAttentionConditionalFMPosterior(
+            encoder=encoder,
+            theta_dim=len(theta_columns),
+            hidden_dim=int(config.get("fm_hidden_dim", 256)),
+            time_embed_dim=int(config.get("time_embed_dim", 64)),
+            sigma_min=float(config.get("sigma_min", 1e-3)),
+            time_prior_exponent=float(config.get("time_prior_exponent", 0.0)),
+            dropout=float(config.get("dropout", 0.05)),
+            num_heads=int(config.get("xattn_num_heads", 4)),
         )
     if method in ("realnvp", "normalizing_flow"):
         return ConditionalFlowPosterior(
@@ -450,7 +470,7 @@ def prepare_observations_from_cache(
 
 def _is_direct_posterior_model(model) -> bool:
     return (
-        isinstance(model, (ConditionalFMPosterior, ConditionalFlowPosterior))
+        isinstance(model, (ConditionalFMPosterior, CrossAttentionConditionalFMPosterior, ConditionalFlowPosterior))
         or getattr(model, "_sbi_artifact_kind", None) == "direct_posterior"
     )
 
@@ -615,7 +635,7 @@ def _sample_direct_posterior(
         errs = input_errors[start:end].to(device)
         obs = input_observed[start:end].to(device)
 
-        if isinstance(model, ConditionalFMPosterior):
+        if isinstance(model, (ConditionalFMPosterior, CrossAttentionConditionalFMPosterior)):
             theta_samples = model.sample(
                 values=vals,
                 errors=errs,

@@ -184,8 +184,10 @@ class RegressionDataset(Dataset):
 
 
 class TransformerScalarRegressor(nn.Module):
-    def __init__(self, input_columns: list[str]):
+    def __init__(self, input_columns: list[str], *, architecture: str = "mean"):
         super().__init__()
+        self.architecture = str(architecture)
+        pooling_mode = "attention" if self.architecture == "attention_pool" else "mean"
         self.encoder = ObservationEncoder(
             input_columns=input_columns,
             dim_value=24,
@@ -199,16 +201,57 @@ class TransformerScalarRegressor(nn.Module):
             dropout=0.05,
             use_missingness_context=True,
             missingness_context_hidden_dim=64,
+            pooling_mode=pooling_mode,
         )
-        self.head = nn.Sequential(
-            nn.LayerNorm(self.encoder.output_dim),
-            nn.Linear(self.encoder.output_dim, 256),
-            nn.SiLU(),
-            nn.Dropout(0.05),
-            nn.Linear(256, 1),
-        )
+        if self.architecture == "xattn_query":
+            self.query = nn.Parameter(torch.zeros(1, 1, self.encoder.output_dim))
+            nn.init.normal_(self.query, mean=0.0, std=0.02)
+            self.query_norm = nn.LayerNorm(self.encoder.output_dim)
+            self.ctx_norm = nn.LayerNorm(self.encoder.output_dim)
+            self.cross_attn = nn.MultiheadAttention(
+                embed_dim=self.encoder.output_dim,
+                num_heads=8,
+                dropout=0.05,
+                batch_first=True,
+            )
+            self.ff_norm = nn.LayerNorm(self.encoder.output_dim)
+            self.ff = nn.Sequential(
+                nn.Linear(self.encoder.output_dim, 256),
+                nn.SiLU(),
+                nn.Dropout(0.05),
+                nn.Linear(256, self.encoder.output_dim),
+            )
+            self.head = nn.Sequential(
+                nn.LayerNorm(self.encoder.output_dim),
+                nn.Linear(self.encoder.output_dim, 256),
+                nn.SiLU(),
+                nn.Dropout(0.05),
+                nn.Linear(256, 1),
+            )
+        else:
+            self.head = nn.Sequential(
+                nn.LayerNorm(self.encoder.output_dim),
+                nn.Linear(self.encoder.output_dim, 256),
+                nn.SiLU(),
+                nn.Dropout(0.05),
+                nn.Linear(256, 1),
+            )
 
     def forward(self, values: torch.Tensor, errors: torch.Tensor, observed: torch.Tensor) -> torch.Tensor:
+        if self.architecture == "xattn_query":
+            tokens, token_mask = self.encoder.forward_tokens(values, errors, observed)
+            ctx_tokens = self.ctx_norm(tokens)
+            query = self.query_norm(self.query.expand(values.shape[0], -1, -1))
+            attn_out, _ = self.cross_attn(
+                query=query,
+                key=ctx_tokens,
+                value=ctx_tokens,
+                key_padding_mask=~token_mask,
+                need_weights=False,
+            )
+            h = query + attn_out
+            h = h + self.ff(self.ff_norm(h))
+            return self.head(h.squeeze(1)).squeeze(-1)
         return self.head(self.encoder(values, errors, observed)).squeeze(-1)
 
 
@@ -237,8 +280,9 @@ def fit_transformer(
     huber_delta: float,
     sample_weights: np.ndarray | None = None,
     sampler_probs: np.ndarray | None = None,
+    architecture: str = "mean",
 ) -> tuple[nn.Module, pd.DataFrame]:
-    model = TransformerScalarRegressor(model_input_columns).to(device)
+    model = TransformerScalarRegressor(model_input_columns, architecture=architecture).to(device)
     train_ds = RegressionDataset(train_arrays, sample_weights=sample_weights)
     val_ds = RegressionDataset(val_arrays)
     sampler = None
@@ -403,9 +447,13 @@ def main() -> None:
     ]
 
     variant_defs = [
-        {"name": "transformer_vanilla", "sampler_probs": None, "use_importance_weights": False},
-        {"name": "transformer_curriculum_only", "sampler_probs": "curriculum", "use_importance_weights": False},
-        {"name": "transformer_curriculum_iw", "sampler_probs": "curriculum", "use_importance_weights": True},
+        {"name": "transformer_mean_vanilla", "architecture": "mean", "sampler_probs": None, "use_importance_weights": False},
+        {"name": "transformer_mean_curriculum_only", "architecture": "mean", "sampler_probs": "curriculum", "use_importance_weights": False},
+        {"name": "transformer_mean_curriculum_iw", "architecture": "mean", "sampler_probs": "curriculum", "use_importance_weights": True},
+        {"name": "transformer_attnpool_vanilla", "architecture": "attention_pool", "sampler_probs": None, "use_importance_weights": False},
+        {"name": "transformer_attnpool_curriculum_iw", "architecture": "attention_pool", "sampler_probs": "curriculum", "use_importance_weights": True},
+        {"name": "transformer_xattn_vanilla", "architecture": "xattn_query", "sampler_probs": None, "use_importance_weights": False},
+        {"name": "transformer_xattn_curriculum_iw", "architecture": "xattn_query", "sampler_probs": "curriculum", "use_importance_weights": True},
     ]
 
     all_results = []
@@ -452,6 +500,7 @@ def main() -> None:
                 huber_delta=args.huber_delta,
                 sample_weights=importance.astype(np.float32) if variant["use_importance_weights"] else None,
                 sampler_probs=sample_probs if variant["sampler_probs"] == "curriculum" else None,
+                architecture=str(variant["architecture"]),
             )
             transformer_models[variant["name"]] = model
             hist = history.copy()

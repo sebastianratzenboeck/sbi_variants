@@ -37,7 +37,7 @@ try:
         parse_column_csv,
     )
     from .encoder import ObservationEncoder
-    from .ratio_models import ConditionalRatioEstimator
+    from .ratio_models import ConditionalRatioEstimator, CrossAttentionConditionalRatioEstimator
     from .train_mock_galaxy import (
         DEFAULT_CLUSTER_ID_COL,
         build_arrays as build_cache_arrays,
@@ -57,7 +57,7 @@ except ImportError:
         parse_column_csv,
     )
     from encoder import ObservationEncoder
-    from ratio_models import ConditionalRatioEstimator
+    from ratio_models import ConditionalRatioEstimator, CrossAttentionConditionalRatioEstimator
     from train_mock_galaxy import (
         DEFAULT_CLUSTER_ID_COL,
         build_arrays as build_cache_arrays,
@@ -518,10 +518,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dropout", type=float, default=0.05)
     p.add_argument("--use-missingness-context", action="store_true", default=False)
     p.add_argument("--missingness-context-hidden-dim", type=int, default=64)
+    p.add_argument("--pooling-mode", type=str, default="mean", choices=["mean", "attention"])
 
     # Ratio head
     p.add_argument("--ratio-hidden-dim", type=int, default=256)
     p.add_argument("--ratio-dropout", type=float, default=0.0)
+    p.add_argument("--ratio-architecture", type=str, default="pooled", choices=["pooled", "xattn"])
+    p.add_argument("--ratio-xattn-heads", type=int, default=4)
     p.add_argument(
         "--ratio-mask-mode",
         type=str,
@@ -823,14 +826,21 @@ def _build_model(args: argparse.Namespace, input_columns: list[str], theta_dim: 
         dropout=args.dropout,
         use_missingness_context=args.use_missingness_context,
         missingness_context_hidden_dim=args.missingness_context_hidden_dim,
+        pooling_mode=args.pooling_mode,
     )
-    return ConditionalRatioEstimator(
+    common_kwargs = dict(
         encoder=encoder,
         theta_dim=theta_dim,
         hidden_dim=args.ratio_hidden_dim,
         dropout=args.ratio_dropout,
         use_mask_condition=(args.ratio_mask_mode != "none"),
     )
+    if str(args.ratio_architecture) == "xattn":
+        return CrossAttentionConditionalRatioEstimator(
+            **common_kwargs,
+            num_heads=args.ratio_xattn_heads,
+        )
+    return ConditionalRatioEstimator(**common_kwargs)
 
 
 def _move_batch(batch: dict[str, torch.Tensor], device: str) -> dict[str, torch.Tensor]:

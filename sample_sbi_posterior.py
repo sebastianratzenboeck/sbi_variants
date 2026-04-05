@@ -27,6 +27,7 @@ try:
     from .posterior_models import (
         ConditionalFMPosterior,
         ConditionalFlowPosterior,
+        CrossAttentionConditionalFMPosterior,
     )
 except ImportError:
     from columns import COLOR_DEFINITIONS, OBS_COLS, OBS_ERR_COLS
@@ -37,6 +38,7 @@ except ImportError:
     from sbi_variants.posterior_models import (
         ConditionalFMPosterior,
         ConditionalFlowPosterior,
+        CrossAttentionConditionalFMPosterior,
     )
 
 
@@ -150,9 +152,10 @@ def _build_model_from_config(
         dropout=float(config.get("dropout", 0.05)),
         use_missingness_context=bool(config.get("use_missingness_context", False)),
         missingness_context_hidden_dim=int(config.get("missingness_context_hidden_dim", 64)),
+        pooling_mode=str(config.get("pooling_mode", "mean")),
     )
     method = str(config.get("method", "flow_matching"))
-    if method == "flow_matching":
+    if method in ("flow_matching", "flow_matching_xattn"):
         return ConditionalFMPosterior(
             encoder=encoder,
             theta_dim=len(theta_columns),
@@ -161,6 +164,17 @@ def _build_model_from_config(
             sigma_min=float(config.get("sigma_min", 1e-3)),
             time_prior_exponent=float(config.get("time_prior_exponent", 0.0)),
             dropout=float(config.get("dropout", 0.05)),
+        )
+    if method == "flow_matching_xattn":
+        return CrossAttentionConditionalFMPosterior(
+            encoder=encoder,
+            theta_dim=len(theta_columns),
+            hidden_dim=int(config.get("fm_hidden_dim", 256)),
+            time_embed_dim=int(config.get("time_embed_dim", 64)),
+            sigma_min=float(config.get("sigma_min", 1e-3)),
+            time_prior_exponent=float(config.get("time_prior_exponent", 0.0)),
+            dropout=float(config.get("dropout", 0.05)),
+            num_heads=int(config.get("xattn_num_heads", 4)),
         )
     if method in ("realnvp", "normalizing_flow"):
         return ConditionalFlowPosterior(
@@ -711,7 +725,7 @@ def main() -> None:
         "use_colors": use_colors,
         "color_names": color_names if use_colors else [],
         "denormalize": bool(args.denormalize),
-        "steps": int(args.steps) if method == "flow_matching" else None,
+        "steps": int(args.steps) if method in ("flow_matching", "flow_matching_xattn") else None,
         "batch_size": int(args.batch_size),
         "elapsed_sec": float(elapsed),
         "outputs": {

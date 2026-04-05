@@ -39,6 +39,7 @@ from sbi_variants.encoder import ObservationEncoder
 from sbi_variants.posterior_models import (
     ConditionalFMPosterior,
     ConditionalFlowPosterior,
+    CrossAttentionConditionalFMPosterior,
 )
 from sbi_variants.value_transforms import apply_inverse_value_transforms_numpy
 try:
@@ -210,7 +211,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--method", type=str, default="flow_matching",
-                   choices=["flow_matching", "normalizing_flow", "realnvp"])
+                   choices=["flow_matching", "flow_matching_xattn", "normalizing_flow", "realnvp"])
 
     p.add_argument("--input-columns", type=str, default=",".join(DEFAULT_INPUT_COLS),
                    help="Comma-separated input columns used as x_obs.")
@@ -396,6 +397,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dropout", type=float, default=0.05)
     p.add_argument("--use-missingness-context", action="store_true", default=False)
     p.add_argument("--missingness-context-hidden-dim", type=int, default=64)
+    p.add_argument("--pooling-mode", type=str, default="mean", choices=["mean", "attention"])
 
     # Color features
     p.add_argument(
@@ -410,6 +412,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sigma-min", type=float, default=1e-3)
     p.add_argument("--time-embed-dim", type=int, default=64)
     p.add_argument("--fm-hidden-dim", type=int, default=256)
+    p.add_argument("--xattn-num-heads", type=int, default=4)
 
     # Normalizing-flow head (package-backed)
     p.add_argument("--nf-hidden-dim", type=int, default=256)
@@ -955,6 +958,7 @@ def _build_model(args: argparse.Namespace, input_columns: list[str], theta_dim: 
         dropout=args.dropout,
         use_missingness_context=args.use_missingness_context,
         missingness_context_hidden_dim=args.missingness_context_hidden_dim,
+        pooling_mode=args.pooling_mode,
     )
 
     if args.method == "flow_matching":
@@ -966,6 +970,17 @@ def _build_model(args: argparse.Namespace, input_columns: list[str], theta_dim: 
             sigma_min=args.sigma_min,
             time_prior_exponent=args.time_prior_exponent,
             dropout=args.dropout,
+        )
+    if args.method == "flow_matching_xattn":
+        return CrossAttentionConditionalFMPosterior(
+            encoder=encoder,
+            theta_dim=theta_dim,
+            hidden_dim=args.fm_hidden_dim,
+            time_embed_dim=args.time_embed_dim,
+            sigma_min=args.sigma_min,
+            time_prior_exponent=args.time_prior_exponent,
+            dropout=args.dropout,
+            num_heads=args.xattn_num_heads,
         )
     if args.method in ("normalizing_flow", "realnvp"):
         return ConditionalFlowPosterior(
@@ -1537,7 +1552,7 @@ def main() -> None:
     # Distribution objects, functools.partial, generator expressions) making
     # compilation pointless — results are correct but every graph fragment
     # falls back to eager.  Only compile for flow-matching.
-    use_compile = bool(args.compile and args.method == "flow_matching")
+    use_compile = bool(args.compile and args.method in {"flow_matching", "flow_matching_xattn"})
     if args.compile and not use_compile:
         print("torch.compile requested, but disabled for NF backend (graph breaks in Zuko/nflows).")
     if use_compile:
@@ -1558,7 +1573,7 @@ def main() -> None:
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr_min)
 
     # NF log_prob/log-det is numerically fragile under autocast; keep AMP for FM only.
-    use_amp_loss = bool(args.amp and args.method == "flow_matching" and device != "cpu")
+    use_amp_loss = bool(args.amp and args.method in {"flow_matching", "flow_matching_xattn"} and device != "cpu")
     if args.amp and args.method in ("normalizing_flow", "realnvp"):
         print("AMP requested, but disabled for NF loss path for numerical stability.")
 

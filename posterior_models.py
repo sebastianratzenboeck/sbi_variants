@@ -163,6 +163,148 @@ class ConditionalFMPosterior(nn.Module):
         return theta.view(B, num_samples, self.theta_dim)
 
 
+class CrossAttentionConditionalFMPosterior(nn.Module):
+    """Flow-matching posterior with token-level cross-attention into observation tokens."""
+
+    def __init__(
+        self,
+        encoder: nn.Module,
+        theta_dim: int,
+        hidden_dim: int = 256,
+        time_embed_dim: int = 64,
+        sigma_min: float = 1e-3,
+        time_prior_exponent: float = 0.0,
+        dropout: float = 0.0,
+        num_heads: int = 4,
+    ):
+        super().__init__()
+        if time_prior_exponent <= -1.0:
+            raise ValueError(f"time_prior_exponent must be > -1, got {time_prior_exponent}")
+        self.encoder = encoder
+        self.theta_dim = int(theta_dim)
+        self.sigma_min = float(sigma_min)
+        self.time_prior_exponent = float(time_prior_exponent)
+
+        self.time_embed = TimeEmbed(time_embed_dim=time_embed_dim)
+        self.theta_proj = nn.Linear(theta_dim, hidden_dim)
+        self.time_proj = nn.Linear(time_embed_dim, hidden_dim)
+        self.token_proj = nn.Linear(int(encoder.output_dim), hidden_dim)
+        self.query_norm = nn.LayerNorm(hidden_dim)
+        self.ctx_norm = nn.LayerNorm(hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=int(num_heads),
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.ff_norm = nn.LayerNorm(hidden_dim)
+        self.ff = _mlp(hidden_dim, hidden_dim, hidden_dim, depth=3, dropout=dropout)
+        self.out = _mlp(hidden_dim, hidden_dim, theta_dim, depth=3, dropout=dropout)
+
+    def sample_t(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        u = torch.rand(batch_size, device=device)
+        return u.pow(1.0 / (1.0 + self.time_prior_exponent))
+
+    def _encode_context(
+        self,
+        values: torch.Tensor,
+        errors: torch.Tensor,
+        observed_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ctx_tokens, token_mask = self.encoder.forward_tokens(values, errors, observed_mask)
+        return self.ctx_norm(self.token_proj(ctx_tokens)), token_mask
+
+    def predict_velocity(
+        self,
+        theta_t: torch.Tensor,
+        t: torch.Tensor,
+        ctx_tokens: torch.Tensor,
+        token_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        t_emb = self.time_embed(t.view(-1, 1, 1))
+        query = self.theta_proj(theta_t) + self.time_proj(t_emb)
+        query = self.query_norm(query).unsqueeze(1)
+        attn_out, _ = self.cross_attn(
+            query=query,
+            key=ctx_tokens,
+            value=ctx_tokens,
+            key_padding_mask=~token_mask,
+            need_weights=False,
+        )
+        h = query + attn_out
+        h = h + self.ff(self.ff_norm(h))
+        return self.out(h.squeeze(1))
+
+    def loss(
+        self,
+        theta: torch.Tensor,
+        values: torch.Tensor,
+        errors: torch.Tensor,
+        observed_mask: torch.Tensor,
+        sample_weights: torch.Tensor | None = None,
+        nll_cap: float = 0.0,
+    ) -> LossResult:
+        del nll_cap
+        B = theta.shape[0]
+        ctx_tokens, token_mask = self._encode_context(values, errors, observed_mask)
+
+        x0 = torch.randn_like(theta)
+        t = self.sample_t(B, theta.device)
+        tt = t.unsqueeze(-1)
+        k = (1.0 - self.sigma_min)
+        theta_t = (1.0 - k * tt) * x0 + tt * theta
+
+        v_tgt = theta - k * x0
+        v_pred = self.predict_velocity(theta_t, t, ctx_tokens, token_mask)
+        per_sample = (v_pred - v_tgt).pow(2).mean(dim=1)
+
+        nll_sum = per_sample.detach().float().sum()
+        if sample_weights is None:
+            return LossResult(loss=per_sample.mean(), nll_sum=nll_sum, n_samples=B, w_sum=float(B))
+        w = sample_weights.to(per_sample.dtype).reshape(-1)
+        denom = w.sum().clamp_min(1e-8)
+        return LossResult(loss=(per_sample * w).sum() / denom, nll_sum=nll_sum, n_samples=B, w_sum=float(denom))
+
+    @torch.no_grad()
+    def sample(
+        self,
+        values: torch.Tensor,
+        errors: torch.Tensor,
+        observed_mask: torch.Tensor,
+        num_samples: int = 256,
+        steps: int = 64,
+        t0: float = 0.0,
+        t1: float = 1.0,
+    ) -> torch.Tensor:
+        B = values.shape[0]
+        if steps <= 0:
+            raise ValueError(f"steps must be >0, got {steps}")
+        if num_samples <= 0:
+            raise ValueError(f"num_samples must be >0, got {num_samples}")
+
+        ctx_tokens, token_mask = self._encode_context(values, errors, observed_mask)
+        ctx_tokens = ctx_tokens.repeat_interleave(num_samples, dim=0)
+        token_mask = token_mask.repeat_interleave(num_samples, dim=0)
+
+        total = B * num_samples
+        theta = torch.randn(total, self.theta_dim, device=values.device)
+        dt = (t1 - t0) / float(steps)
+
+        was_training = self.training
+        self.eval()
+        try:
+            for i in range(steps):
+                t = t0 + i * dt
+                t_batch = torch.full((total,), float(t), device=values.device, dtype=values.dtype)
+                v = self.predict_velocity(theta, t_batch, ctx_tokens, token_mask)
+                theta = theta + dt * v
+        finally:
+            if was_training:
+                self.train()
+
+        return theta.view(B, num_samples, self.theta_dim)
+
+
 class ConditionalFlowPosterior(nn.Module):
     """Conditional normalizing-flow posterior (package-backed: zuko or nflows)."""
 
